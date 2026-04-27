@@ -1,0 +1,99 @@
+{
+  "mqtt": {
+    "broker": "mosquitto.service.consul:1883",
+    "username": "mqtt-consumer",
+    "password": "${MQTT_PASSWORD}",
+    "topics": [
+      "gps/+/+"
+    ],
+    "qos": 1,
+    "clientId": "mqtt-consumer-${INSTANCE_ID}",
+    "keepAlive": 60,
+    "cleanSession": false,
+    "autoReconnect": true,
+    "maxReconnectInterval": 30
+  },
+  "redis": {
+    "cluster": true,
+    "nodes": [
+      "redis-01.service.consul:6379",
+      "redis-02.service.consul:6379",
+      "redis-03.service.consul:6379"
+    ],
+    "password": "${REDIS_PASSWORD}",
+    "db": 0,
+    "streamConfig": {
+      "realtime": "gps:realtime:{orgId}",
+      "batch": "gps:batch:{orgId}",
+      "dlq": "gps:dlq:{orgId}",
+      "maxLen": {
+        "realtime": 5000,
+        "batch": 100000
+      }
+    },
+    "hashConfig": {
+      "latestState": "vehicle:{orgId}:{vehicleId}",
+      "metadata": "vehicle_meta:{vehicleId}",
+      "ttlSeconds": 30
+    }
+  },
+  "clickhouse": {
+    "directWriteEnabled": false,
+    "host": "clickhouse.service.consul:8123",
+    "username": "mqtt-consumer",
+    "password": "${CLICKHOUSE_PASSWORD}",
+    "database": "default",
+    "table": "gps_events",
+    "batchSize": 100,
+    "flushInterval": "5s",
+    "connectionPool": {
+      "maxOpen": 10,
+      "maxIdle": 5,
+      "maxLifetime": "5m"
+    }
+  },
+  "processing": {
+    "workers": 8,
+    "bufferSize": 10000,
+    "movementFilter": {
+      "minDistanceMeters": 20,
+      "minTimeSeconds": 5
+    },
+    "criticalEvents": [
+      "PANIC_BUTTON",
+      "OVERSPEED",
+      "GPS_SIGNAL_LOST",
+      "GEOFENCE_ENTER",
+      "GEOFENCE_EXIT"
+    ],
+    "enrichment": {
+      "cacheTTL": 300,
+      "fallbackSource": "postgresql://supabase.service.consul"
+    },
+    "backpressure": {
+      "maxRedisLatencyMs": 50,
+      "localBufferSize": 10000,
+      "dropPriority": "hot_path_first"
+    }
+  },
+  "metrics": {
+    "port": 9090,
+    "path": "/metrics",
+    "namespace": "mqtt_consumer",
+    "histogramBuckets": [
+      0.001,
+      0.005,
+      0.01,
+      0.05,
+      0.1,
+      0.5,
+      1,
+      5
+    ]
+  },
+  "logging": {
+    "level": "info",
+    "format": "json",
+    "output": "stdout"
+  }
+}
