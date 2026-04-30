@@ -1,29 +1,10 @@
 // mqtt-consumer/main.go
-//
+// All types, clients, and helpers live in internal.go (same package).
 // Fixes applied (scalability audit):
-//  1. [CRASH]   NewMetricsCollector: all 9 Prometheus fields now initialised
-//               before MustRegister — eventsFiltered, redisWriteErrors,
-//               clickhouseWriteErrors, redisLatency, bufferSize,
-//               workerQueueLength were nil → immediate startup panic.
-//  2. [COMPILE] Increment() and RecordProcessingTime() methods added to
-//               MetricsCollector — processWorker called both but neither
-//               existed on the struct.
-//  3. [SCALE]   startMetricsServer reads METRICS_PORT from env (injected by
-//               the orchestrator as 9100, 9101 … per replica) instead of the
-//               hard-coded 9090 that caused "address already in use" on
-//               replica 1+.
-//  4. [SCALE]   ConsumerName is set from INSTANCE_ID env var (e.g.
-//               "mqtt-consumer-0") so every replica in the Redis consumer
-//               group has a unique identity. The original hard-coded
-//               "batch-writer" (copy-paste) caused siblings to steal each
-//               other's messages and miss ACKs.
-//  5. [LOGIC]   handleBackpressure() is now implemented. When Redis XADD
-//               latency exceeds maxRedisLatencyMs (50 ms per the architecture
-//               spec) the event is written to an in-memory ring buffer
-//               (capacity 10 000). A background drainer flushes that buffer
-//               back to Redis once latency recovers. Hot-path (critical)
-//               events are retained; normal events are dropped first when the
-//               buffer is full.
+//  1. All 9 Prometheus fields initialised; Increment() and RecordProcessingTime() defined.
+//  2. Metrics port from METRICS_PORT env.
+//  3. ConsumerName from INSTANCE_ID env (was "batch-writer").
+//  4. handleBackpressure() implemented with ring buffer.
 package main
 
 import (
@@ -39,14 +20,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/trace"
+	"github.com/redis/go-redis/v9"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Configuration
+// Config types
 // ─────────────────────────────────────────────────────────────────────────────
 
 type Config struct {
@@ -66,10 +47,9 @@ type MQTTConfig struct {
 }
 
 type RedisConfig struct {
-	Cluster  bool
-	Nodes    []string
-	Password string
-	// ConsumerGroup / ConsumerName are set at runtime.
+	Cluster       bool
+	Nodes         []string
+	Password      string
 	ConsumerGroup string
 	ConsumerName  string
 }
@@ -90,11 +70,8 @@ type MovementFilter struct {
 }
 
 type BackpressureConfig struct {
-	// MaxRedisLatencyMs is the XADD latency threshold above which events are
-	// diverted to the local ring buffer instead of Redis.
 	MaxRedisLatencyMs int64
-	// LocalBufferSize is the capacity of the in-memory ring buffer.
-	LocalBufferSize int
+	LocalBufferSize   int
 }
 
 type ProcessingConfig struct {
@@ -114,9 +91,8 @@ type MetricsConfig struct {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func loadConfig() Config {
-	// INSTANCE_ID injected by orchestrator: "mqtt-consumer-0", "mqtt-consumer-1" …
-	instanceID := envOr("INSTANCE_ID", "mqtt-consumer-0")
-	metricsPort := envInt("METRICS_PORT", 9090) // FIX: was hard-coded 9090
+	instanceID  := envOr("INSTANCE_ID", "mqtt-consumer-0")
+	metricsPort := envInt("METRICS_PORT", 9090) // FIX: from env
 
 	return Config{
 		MQTT: MQTTConfig{
@@ -131,7 +107,7 @@ func loadConfig() Config {
 			Nodes:         []string{"redis-01:6379", "redis-02:6379", "redis-03:6379"},
 			Password:      os.Getenv("REDIS_PASSWORD"),
 			ConsumerGroup: "mqtt-consumers",
-			ConsumerName:  instanceID, // FIX: unique per replica; was "batch-writer"
+			ConsumerName:  instanceID, // FIX: was "batch-writer"
 		},
 		ClickHouse: ClickHouseConfig{
 			DirectWriteEnabled: false,
@@ -150,49 +126,18 @@ func loadConfig() Config {
 				MinTimeSeconds:    5,
 			},
 			Backpressure: BackpressureConfig{
-				MaxRedisLatencyMs: 50,    // from architecture spec
-				LocalBufferSize:   10000, // from architecture spec
+				MaxRedisLatencyMs: 50,
+				LocalBufferSize:   10000,
 			},
 		},
-		Metrics: MetricsConfig{
-			Port: metricsPort, // FIX: from env, not hard-coded
-			Path: "/metrics",
-		},
+		Metrics: MetricsConfig{Port: metricsPort, Path: "/metrics"},
 	}
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Tracing
-// ─────────────────────────────────────────────────────────────────────────────
-
-func setupTracing(serviceName string) (trace.TracerProvider, error) {
-	exp, err := jaeger.New(jaeger.WithCollectorEndpoint(
-		jaeger.WithEndpoint(os.Getenv("JAEGER_ENDPOINT")),
-	))
-	if err != nil {
-		return nil, err
-	}
-
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exp),
-		sdktrace.WithResource(resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceNameKey.String(serviceName),
-			attribute.String("environment", "production"),
-			attribute.String("instance_id", envOr("INSTANCE_ID", "unknown")),
-		)),
-		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(0.1))),
-	)
-
-	otel.SetTracerProvider(tp)
-	return tp, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Prometheus metrics
-//
-// FIX 1: all 9 fields are now initialised before MustRegister.
-// FIX 2: Increment() and RecordProcessingTime() methods are now defined.
+// FIX 1: all 9 fields initialised (6 were nil → MustRegister panic)
+// FIX 2: Increment() and RecordProcessingTime() methods now defined
 // ─────────────────────────────────────────────────────────────────────────────
 
 type MetricsCollector struct {
@@ -210,70 +155,40 @@ type MetricsCollector struct {
 func NewMetricsCollector() *MetricsCollector {
 	m := &MetricsCollector{
 		eventsReceived: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "mqtt_consumer_events_received_total",
-			Help: "Total number of MQTT events received",
-		}),
+			Name: "mqtt_consumer_events_received_total"}),
 		eventsProcessed: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "mqtt_consumer_events_processed_total",
-			Help: "Total number of events processed",
-		}),
-		// FIX: was nil — uninitialised before MustRegister
+			Name: "mqtt_consumer_events_processed_total"}),
 		eventsFiltered: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "mqtt_consumer_events_filtered_total",
-			Help: "Total number of events filtered by movement filter",
-		}),
+			Name: "mqtt_consumer_events_filtered_total"}),
 		redisWriteErrors: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "mqtt_consumer_redis_write_errors_total",
-			Help: "Total number of Redis write errors",
-		}),
+			Name: "mqtt_consumer_redis_write_errors_total"}),
 		clickhouseWriteErrors: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "mqtt_consumer_clickhouse_write_errors_total",
-			Help: "Total number of ClickHouse direct-write errors",
-		}),
+			Name: "mqtt_consumer_clickhouse_write_errors_total"}),
 		processingTime: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "mqtt_consumer_event_processing_duration_ms",
-			Help:    "Event processing duration in milliseconds",
 			Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5},
 		}),
-		// FIX: was nil
 		redisLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "mqtt_consumer_redis_write_latency_ms",
-			Help:    "Redis XADD latency in milliseconds",
 			Buckets: []float64{1, 5, 10, 25, 50, 100, 250, 500},
 		}),
-		// FIX: was nil
 		bufferSize: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "mqtt_consumer_backpressure_buffer_size",
-			Help: "Current number of events in the local backpressure buffer",
-		}),
-		// FIX: was nil
+			Name: "mqtt_consumer_backpressure_buffer_size"}),
 		workerQueueLength: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "mqtt_consumer_worker_queue_length",
-			Help: "Current number of messages waiting in the worker input channel",
-		}),
+			Name: "mqtt_consumer_worker_queue_length"}),
 	}
-
 	prometheus.MustRegister(
-		m.eventsReceived,
-		m.eventsProcessed,
-		m.eventsFiltered,
-		m.redisWriteErrors,
-		m.clickhouseWriteErrors,
-		m.processingTime,
-		m.redisLatency,
-		m.bufferSize,
-		m.workerQueueLength,
+		m.eventsReceived, m.eventsProcessed, m.eventsFiltered,
+		m.redisWriteErrors, m.clickhouseWriteErrors, m.processingTime,
+		m.redisLatency, m.bufferSize, m.workerQueueLength,
 	)
-
 	return m
 }
 
-// Increment is the generic counter helper called by processWorker.
-// FIX: this method did not exist; processWorker called it causing compile failure.
+// Increment is the named counter helper called from processWorker.
+// FIX: was called but not defined → compile error.
 func (m *MetricsCollector) Increment(name string) {
 	switch name {
-	case "parse_errors", "enrichment_errors":
-		// Not separately tracked — fall through; add counters here as needed.
 	case "filtered_events":
 		m.eventsFiltered.Inc()
 	case "redis_write_errors":
@@ -283,82 +198,62 @@ func (m *MetricsCollector) Increment(name string) {
 	}
 }
 
-// RecordProcessingTime records a single event's end-to-end processing latency.
-// FIX: this method did not exist; processWorker called it causing compile failure.
+// RecordProcessingTime records per-event latency.
+// FIX: was called but not defined → compile error.
 func (m *MetricsCollector) RecordProcessingTime(d time.Duration) {
 	m.processingTime.Observe(float64(d.Milliseconds()))
 	m.eventsProcessed.Inc()
 }
 
-// ObserveRedisLatency records the wall-clock time of a Redis XADD call.
 func (m *MetricsCollector) ObserveRedisLatency(d time.Duration) {
 	m.redisLatency.Observe(float64(d.Milliseconds()))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Backpressure buffer
-//
-// FIX 5: handleBackpressure was called by processWorker but never defined.
-// Architecture spec: when Redis XADD latency > 50 ms, divert events to a
-// local 10 000-slot ring buffer. Drop normal events first (hot-path-first).
-// A background drainer retries Redis writes once latency recovers.
+// Backpressure ring buffer
+// FIX: handleBackpressure was called but never defined.
+// Architecture spec: lag > 50 ms → divert to local 10 000-slot buffer.
+// Critical events retained; normal events dropped first (hot-path-first).
 // ─────────────────────────────────────────────────────────────────────────────
 
-// BackpressureBuffer is a thread-safe ring buffer with priority-aware eviction.
-// Critical events (PANIC_BUTTON, OVERSPEED, GPS_SIGNAL_LOST, GEOFENCE_*) are
-// never dropped while normal events are evicted first when the buffer is full.
 type BackpressureBuffer struct {
 	mu       sync.Mutex
-	normal   []EnrichedEvent // lower priority; dropped first
-	critical []EnrichedEvent // never evicted; bounded by capacity/2
+	normal   []EnrichedEvent // defined in internal.go
+	critical []EnrichedEvent
 	capacity int
-
-	// Atomic flag: 1 = Redis latency is elevated, drain is paused.
 	degraded atomic.Int32
-
-	metrics *MetricsCollector
+	metrics  *MetricsCollector
 }
 
-func NewBackpressureBuffer(capacity int, metrics *MetricsCollector) *BackpressureBuffer {
+func NewBackpressureBuffer(capacity int, m *MetricsCollector) *BackpressureBuffer {
 	return &BackpressureBuffer{
 		capacity: capacity,
 		normal:   make([]EnrichedEvent, 0, capacity),
 		critical: make([]EnrichedEvent, 0, capacity/2),
-		metrics:  metrics,
+		metrics:  m,
 	}
 }
 
-// Push adds an event to the buffer. If the buffer is full, normal events are
-// dropped to make room. Critical events are always accepted up to capacity/2.
-func (b *BackpressureBuffer) Push(event EnrichedEvent) {
+func (b *BackpressureBuffer) Push(ev EnrichedEvent) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
-	if isCriticalEvent(event) {
+	if isCriticalEvent(ev) { // defined in internal.go
 		if len(b.critical) < b.capacity/2 {
-			b.critical = append(b.critical, event)
+			b.critical = append(b.critical, ev)
 		}
-		// Drop silently if critical buffer also full — last resort.
 	} else {
-		if len(b.normal)+len(b.critical) >= b.capacity {
-			// Drop the oldest normal event (hot-path-first per spec).
-			if len(b.normal) > 0 {
-				b.normal = b.normal[1:]
-			}
+		if len(b.normal)+len(b.critical) >= b.capacity && len(b.normal) > 0 {
+			b.normal = b.normal[1:] // evict oldest normal event
 		}
-		b.normal = append(b.normal, event)
+		b.normal = append(b.normal, ev)
 	}
-
 	b.metrics.bufferSize.Set(float64(len(b.normal) + len(b.critical)))
 }
 
-// Drain returns up to n events, critical events first.
 func (b *BackpressureBuffer) Drain(n int) []EnrichedEvent {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
 	var out []EnrichedEvent
-
 	for len(out) < n && len(b.critical) > 0 {
 		out = append(out, b.critical[0])
 		b.critical = b.critical[1:]
@@ -367,7 +262,6 @@ func (b *BackpressureBuffer) Drain(n int) []EnrichedEvent {
 		out = append(out, b.normal[0])
 		b.normal = b.normal[1:]
 	}
-
 	b.metrics.bufferSize.Set(float64(len(b.normal) + len(b.critical)))
 	return out
 }
@@ -385,10 +279,7 @@ func (b *BackpressureBuffer) SetDegraded(v bool) {
 		b.degraded.Store(0)
 	}
 }
-
-func (b *BackpressureBuffer) IsDegraded() bool {
-	return b.degraded.Load() == 1
-}
+func (b *BackpressureBuffer) IsDegraded() bool { return b.degraded.Load() == 1 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Worker pool
@@ -396,47 +287,39 @@ func (b *BackpressureBuffer) IsDegraded() bool {
 
 type WorkerPool struct {
 	workers      int
-	inputChannel chan MQTTMessage
+	inputChannel chan MQTTMessage // defined in internal.go
 	redisClient  *redis.ClusterClient
-	chClient     *clickhouse.Conn
+	chConn       *driver.Conn
 	metrics      *MetricsCollector
 	bpBuffer     *BackpressureBuffer
 	bpMaxLatency time.Duration
 	stopChan     chan struct{}
 }
 
-func NewWorkerPool(
-	config ProcessingConfig,
-	redisClient *redis.ClusterClient,
-	chClient *clickhouse.Conn,
-	metrics *MetricsCollector,
-) *WorkerPool {
-	bp := NewBackpressureBuffer(config.Backpressure.LocalBufferSize, metrics)
+func NewWorkerPool(cfg ProcessingConfig, rdb *redis.ClusterClient, ch *driver.Conn, m *MetricsCollector) *WorkerPool {
 	return &WorkerPool{
-		workers:      config.Workers,
-		inputChannel: make(chan MQTTMessage, config.BufferSize),
-		redisClient:  redisClient,
-		chClient:     chClient,
-		metrics:      metrics,
-		bpBuffer:     bp,
-		bpMaxLatency: time.Duration(config.Backpressure.MaxRedisLatencyMs) * time.Millisecond,
+		workers:      cfg.Workers,
+		inputChannel: make(chan MQTTMessage, cfg.BufferSize),
+		redisClient:  rdb,
+		chConn:       ch,
+		metrics:      m,
+		bpBuffer:     NewBackpressureBuffer(cfg.Backpressure.LocalBufferSize, m),
+		bpMaxLatency: time.Duration(cfg.Backpressure.MaxRedisLatencyMs) * time.Millisecond,
 		stopChan:     make(chan struct{}),
 	}
 }
 
 func (p *WorkerPool) Start() {
 	for i := 0; i < p.workers; i++ {
-		go p.processWorker(i)
+		go p.processWorker()
 	}
 	go p.drainBackpressureBuffer()
 	go p.reportQueueDepth()
 }
 
-func (p *WorkerPool) Stop() {
-	close(p.stopChan)
-}
+func (p *WorkerPool) Stop() { close(p.stopChan) }
 
-func (p *WorkerPool) processWorker(id int) {
+func (p *WorkerPool) processWorker() {
 	for {
 		select {
 		case <-p.stopChan:
@@ -446,100 +329,82 @@ func (p *WorkerPool) processWorker(id int) {
 				return
 			}
 			p.metrics.eventsReceived.Inc()
-			startTime := time.Now()
+			start := time.Now()
 
+			// parseMQTTMessage, enrichEvent, shouldBroadcast, isCriticalEvent
+			// writeToBatchStream, writeToRedisStreams, writeToClickhouse
+			// — all defined in internal.go
 			event, err := parseMQTTMessage(msg)
 			if err != nil {
 				p.metrics.Increment("parse_errors")
 				continue
 			}
 
-			enrichedEvent, err := enrichEvent(event, p.redisClient)
-			if err != nil {
-				p.metrics.Increment("enrichment_errors")
-				// Continue with partial enrichment.
-			}
+			enriched, _ := enrichEvent(event, p.redisClient)
 
-			if !shouldBroadcast(enrichedEvent) && !isCriticalEvent(enrichedEvent) {
+			if !shouldBroadcast(enriched) && !isCriticalEvent(enriched) {
 				p.metrics.Increment("filtered_events")
-				writeToBatchStream(enrichedEvent, p.redisClient)
+				writeToBatchStream(enriched, p.redisClient)
 				continue
 			}
 
-			if err = p.writeToRedisStreams(enrichedEvent); err != nil {
+			if err = p.timedRedisWrite(enriched); err != nil {
 				p.metrics.Increment("redis_write_errors")
-				// FIX: handleBackpressure is now defined on the pool.
-				p.handleBackpressure(enrichedEvent)
+				p.handleBackpressure(enriched) // FIX: now defined below
 			}
 
-			if p.chClient != nil && isCriticalEvent(enrichedEvent) {
-				if err = writeToClickhouse(enrichedEvent, p.chClient); err != nil {
+			if p.chConn != nil && isCriticalEvent(enriched) {
+				if err = writeToClickhouse(enriched, p.chConn); err != nil {
 					p.metrics.Increment("clickhouse_write_errors")
 				}
 			}
 
-			p.metrics.RecordProcessingTime(time.Since(startTime))
+			p.metrics.RecordProcessingTime(time.Since(start))
 		}
 	}
 }
 
-// writeToRedisStreams measures XADD latency and updates the degraded flag.
-func (p *WorkerPool) writeToRedisStreams(event EnrichedEvent) error {
+// timedRedisWrite writes to both Redis streams and records XADD latency for
+// the backpressure degraded-mode flag.
+func (p *WorkerPool) timedRedisWrite(ev EnrichedEvent) error {
 	start := time.Now()
-
-	realtimeStream := fmt.Sprintf("gps:realtime:%s", event.OrgID)
-	err := p.redisClient.XAdd(context.Background(), &redis.XAddArgs{
-		Stream: realtimeStream,
-		MaxLen: 5000,
-		Approx: true,
-		Values: event.ToMap(),
-	}).Err()
-
+	err := writeToRedisStreams(ev, p.redisClient)
 	latency := time.Since(start)
 	p.metrics.ObserveRedisLatency(latency)
-
-	// Update degraded flag so the drain loop knows whether to retry.
 	p.bpBuffer.SetDegraded(latency > p.bpMaxLatency)
-
 	return err
 }
 
 // handleBackpressure diverts an event to the local ring buffer when Redis is
-// slow or unavailable. The background drainer will retry when latency recovers.
-// FIX: previously called in processWorker but the function did not exist.
-func (p *WorkerPool) handleBackpressure(event EnrichedEvent) {
-	p.bpBuffer.Push(event)
-	log.Printf("[mqtt-consumer] backpressure: buffered event vehicle=%s (buffer_len=%d)",
-		event.VehicleID, p.bpBuffer.Len())
+// slow or unavailable.
+// FIX: was called in processWorker but never defined → compile error.
+func (p *WorkerPool) handleBackpressure(ev EnrichedEvent) {
+	p.bpBuffer.Push(ev)
+	log.Printf("[mqtt-consumer] backpressure vehicle=%s buffer=%d",
+		ev.VehicleID, p.bpBuffer.Len())
 }
 
-// drainBackpressureBuffer retries buffered events once Redis latency recovers.
 func (p *WorkerPool) drainBackpressureBuffer() {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-p.stopChan:
-			// Best-effort flush on shutdown.
 			p.flushBuffer()
 			return
 		case <-ticker.C:
-			if p.bpBuffer.IsDegraded() || p.bpBuffer.Len() == 0 {
-				continue
+			if !p.bpBuffer.IsDegraded() && p.bpBuffer.Len() > 0 {
+				p.flushBuffer()
 			}
-			p.flushBuffer()
 		}
 	}
 }
 
 func (p *WorkerPool) flushBuffer() {
-	const drainBatch = 200
 	for p.bpBuffer.Len() > 0 {
-		events := p.bpBuffer.Drain(drainBatch)
+		events := p.bpBuffer.Drain(200)
 		for _, ev := range events {
-			if err := p.writeToRedisStreams(ev); err != nil {
-				// Still degraded — push back and abort this drain cycle.
+			if err := p.timedRedisWrite(ev); err != nil {
 				p.bpBuffer.Push(ev)
 				return
 			}
@@ -547,7 +412,6 @@ func (p *WorkerPool) flushBuffer() {
 	}
 }
 
-// reportQueueDepth periodically updates the worker queue length gauge.
 func (p *WorkerPool) reportQueueDepth() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -562,39 +426,31 @@ func (p *WorkerPool) reportQueueDepth() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Metrics + health HTTP server
-// FIX: port from env, not hard-coded 9090
+// Metrics + health — FIX: port from env
 // ─────────────────────────────────────────────────────────────────────────────
 
-func startMetricsServer(config MetricsConfig) {
+func startMetricsServer(cfg MetricsConfig) {
 	mux := http.NewServeMux()
-	mux.Handle(config.Path, promhttp.Handler())
+	mux.Handle(cfg.Path, promhttp.Handler())
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-
-	addr := fmt.Sprintf(":%d", config.Port)
-	log.Printf("[mqtt-consumer] metrics + health on %s", addr)
-
-	srv := &http.Server{Addr: addr, Handler: mux}
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Printf("[mqtt-consumer] metrics server error: %v", err)
+	addr := fmt.Sprintf(":%d", cfg.Port)
+	log.Printf("[mqtt-consumer] metrics+health on %s", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Printf("[mqtt-consumer] metrics server: %v", err)
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MQTT message handler
-// ─────────────────────────────────────────────────────────────────────────────
-
-func handleMQTTMessages(client MQTTClient, workerPool *WorkerPool) {
+func handleMQTTMessages(client MQTTClient, pool *WorkerPool) {
 	for {
 		msg, err := client.Receive()
 		if err != nil {
-			log.Printf("[mqtt-consumer] receive error: %v", err)
+			log.Printf("[mqtt-consumer] receive: %v", err)
 			continue
 		}
-		workerPool.inputChannel <- msg
+		pool.inputChannel <- msg
 	}
 }
 
@@ -604,49 +460,44 @@ func handleMQTTMessages(client MQTTClient, workerPool *WorkerPool) {
 
 func main() {
 	log.Println("[mqtt-consumer] starting...")
+	cfg := loadConfig()
 
-	config := loadConfig()
-
-	tracerProvider, err := setupTracing("mqtt-consumer")
+	// setupTracing defined in internal.go; returns (func(ctx) error, error)
+	shutdown, err := setupTracing("mqtt-consumer")
 	if err != nil {
-		log.Fatalf("[mqtt-consumer] tracing setup: %v", err)
+		log.Fatalf("[mqtt-consumer] tracing: %v", err)
 	}
-	defer tracerProvider.Shutdown(context.Background())
+	defer shutdown(context.Background())
 
 	metrics := NewMetricsCollector()
+	rdb     := initRedisClusterClient(cfg.Redis) // internal.go
 
-	redisClient := initRedisClusterClient(config.Redis)
-
-	var clickhouseWriter *clickhouse.Conn
-	if config.ClickHouse.DirectWriteEnabled {
-		clickhouseWriter, err = initClickHouseClient(config.ClickHouse)
+	var chConn *driver.Conn
+	if cfg.ClickHouse.DirectWriteEnabled {
+		chConn, err = initClickHouseClient(cfg.ClickHouse) // internal.go
 		if err != nil {
-			log.Printf("[mqtt-consumer] ClickHouse init failed (non-fatal): %v", err)
+			log.Printf("[mqtt-consumer] ClickHouse unavailable: %v", err)
 		}
 	}
 
-	workerPool := NewWorkerPool(config.Processing, redisClient, clickhouseWriter, metrics)
-	mqttClient := initMQTTClient(config.MQTT)
+	pool   := NewWorkerPool(cfg.Processing, rdb, chConn, metrics)
+	client := initMQTTClient(cfg.MQTT) // internal.go
 
-	workerPool.Start()
-	go startMetricsServer(config.Metrics)
-	go handleMQTTMessages(mqttClient, workerPool)
+	pool.Start()
+	go startMetricsServer(cfg.Metrics)
+	go handleMQTTMessages(client, pool)
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	log.Printf("[mqtt-consumer] running (instance=%s, metrics-port=%d)",
-		envOr("INSTANCE_ID", "mqtt-consumer-0"), config.Metrics.Port)
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	log.Printf("[mqtt-consumer] running (instance=%s port=%d)",
+		envOr("INSTANCE_ID", "mqtt-consumer-0"), cfg.Metrics.Port)
 
-	<-sigChan
+	<-sig
 	log.Println("[mqtt-consumer] shutting down...")
-	mqttClient.Disconnect(250)
-	workerPool.Stop()
-	log.Println("[mqtt-consumer] shutdown complete")
+	client.Disconnect(250)
+	pool.Stop()
+	log.Println("[mqtt-consumer] done")
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
