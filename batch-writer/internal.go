@@ -1,6 +1,7 @@
 // batch-writer/internal.go
-// Defines all types, client wrappers, and helper functions used by main.go.
-// Lives in the same `package main` so every symbol is directly accessible.
+//
+// All types, client wrappers, and helpers for the batch-writer.
+// Same package as main.go — every symbol is directly accessible.
 package main
 
 import (
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -26,8 +28,6 @@ import (
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tracing
-// Returns a shutdown function rather than the TracerProvider interface so the
-// caller can defer shutdown without importing the sdk/trace package.
 // ─────────────────────────────────────────────────────────────────────────────
 
 func setupTracing(serviceName string) (func(context.Context) error, error) {
@@ -56,12 +56,148 @@ func setupTracing(serviceName string) (func(context.Context) error, error) {
 		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(0.05))),
 	)
 	otel.SetTracerProvider(tp)
-
 	return tp.Shutdown, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Redis
+// StreamRegistry
+//
+// Redis Streams XREADGROUP does NOT accept glob patterns — every stream key
+// must be named explicitly. StreamRegistry solves this by:
+//
+//   1. Scanning Redis for keys matching the batch prefix (e.g. "gps:batch:*").
+//   2. Running XGROUP CREATE … MKSTREAM for any newly-discovered key so the
+//      consumer group exists before we try to read from it.
+//   3. Periodically re-scanning to pick up new org streams without restart.
+//   4. Exposing StreamArgs() which returns the correctly-formatted slice
+//      [key1, key2, …, ">", ">", …] that XReadGroup expects.
+// ─────────────────────────────────────────────────────────────────────────────
+
+type StreamRegistry struct {
+	rdb    *redis.ClusterClient
+	cfg    RedisConfig
+	mu     sync.RWMutex
+	known  map[string]struct{} // keys we have already created a consumer group for
+}
+
+func NewStreamRegistry(rdb *redis.ClusterClient, cfg RedisConfig) *StreamRegistry {
+	return &StreamRegistry{
+		rdb:   rdb,
+		cfg:   cfg,
+		known: make(map[string]struct{}),
+	}
+}
+
+// Bootstrap performs an initial SCAN so the first read has streams to consume.
+func (r *StreamRegistry) Bootstrap(ctx context.Context) error {
+	return r.refresh(ctx)
+}
+
+// Run refreshes the registry at cfg.ReadConfig.StreamRefreshInterval until ctx
+// is cancelled. Intended to be called in a dedicated goroutine.
+func (r *StreamRegistry) Run(ctx context.Context) {
+	ticker := time.NewTicker(r.cfg.ReadConfig.StreamRefreshInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := r.refresh(ctx); err != nil {
+				log.Printf("[batch-writer/registry] refresh error: %v", err)
+			}
+		}
+	}
+}
+
+// Keys returns a snapshot of all currently-known stream keys.
+func (r *StreamRegistry) Keys() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	keys := make([]string, 0, len(r.known))
+	for k := range r.known {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// StreamArgs returns the stream-slice expected by XReadGroupArgs:
+//
+//	[key1, key2, …, ">", ">", …]
+//
+// Returns nil when no streams are known yet.
+func (r *StreamRegistry) StreamArgs() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.known) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(r.known)*2)
+	for k := range r.known {
+		keys = append(keys, k)
+	}
+	for range r.known {
+		keys = append(keys, ">")
+	}
+	return keys
+}
+
+// refresh scans Redis for batch stream keys and creates consumer groups for
+// any that are new. Safe to call concurrently — it only holds the write lock
+// at the very end when updating r.known.
+func (r *StreamRegistry) refresh(ctx context.Context) error {
+	pattern := r.cfg.Streams.BatchPrefix + "*"
+	var found []string
+
+	// SCAN across all cluster nodes (go-redis v9 ClusterClient handles fanout).
+	iter := r.rdb.Scan(ctx, 0, pattern, 0).Iterator()
+	for iter.Next(ctx) {
+		found = append(found, iter.Val())
+	}
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("SCAN %s: %w", pattern, err)
+	}
+
+	r.mu.RLock()
+	var newKeys []string
+	for _, key := range found {
+		if _, exists := r.known[key]; !exists {
+			newKeys = append(newKeys, key)
+		}
+	}
+	r.mu.RUnlock()
+
+	// Create consumer groups for new keys — MKSTREAM creates the stream if it
+	// doesn't exist, $ means "only new messages from now on".
+	for _, key := range newKeys {
+		err := r.rdb.XGroupCreateMkStream(ctx, key, r.cfg.ConsumerGroup, "$").Err()
+		if err != nil && !isGroupExistsErr(err) {
+			log.Printf("[batch-writer/registry] XGroupCreateMkStream key=%s: %v", key, err)
+			continue // don't add to known — retry next refresh cycle
+		}
+		log.Printf("[batch-writer/registry] registered stream %s", key)
+	}
+
+	if len(newKeys) > 0 {
+		r.mu.Lock()
+		for _, key := range newKeys {
+			r.known[key] = struct{}{}
+		}
+		r.mu.Unlock()
+	}
+
+	return nil
+}
+
+// isGroupExistsErr returns true when Redis reports the consumer group already
+// exists — this is not an error condition for us.
+func isGroupExistsErr(err error) bool {
+	return strings.Contains(err.Error(), "BUSYGROUP")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Redis client
 // ─────────────────────────────────────────────────────────────────────────────
 
 // RedisMessage is a single entry read from a Redis stream consumer group.
@@ -80,7 +216,6 @@ func initRedisClusterClient(cfg RedisConfig) *redis.ClusterClient {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
 	if err := client.Ping(ctx).Err(); err != nil {
 		log.Printf("[batch-writer] redis ping warning: %v", err)
 	}
@@ -91,8 +226,6 @@ func initRedisClusterClient(cfg RedisConfig) *redis.ClusterClient {
 // ClickHouse
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ClickHouseWriter wraps the native clickhouse-go v2 driver connection and
-// exposes only the batch-insert surface needed by BatchProcessor.
 type ClickHouseWriter struct {
 	conn driver.Conn
 }
@@ -105,10 +238,10 @@ func NewClickHouseWriter(cfg ClickHouseConfig) (*ClickHouseWriter, error) {
 			Username: cfg.Username,
 			Password: cfg.Password,
 		},
-		Compression: &clickhouse.Compression{Method: clickhouse.CompressionLZ4},
-		MaxOpenConns: cfg.Performance.ConnectionPool.MaxOpen,
-		MaxIdleConns: cfg.Performance.ConnectionPool.MaxIdle,
-		ConnMaxLifetime: cfg.Performance.ConnectionPool.MaxLifetime,
+		Compression:     &clickhouse.Compression{Method: clickhouse.CompressionLZ4},
+		MaxOpenConns:    cfg.Performance.MaxOpen,
+		MaxIdleConns:    cfg.Performance.MaxIdle,
+		ConnMaxLifetime: cfg.Performance.MaxLifetime,
 		Settings: clickhouse.Settings{
 			"max_execution_time": 60,
 		},
@@ -127,55 +260,85 @@ func NewClickHouseWriter(cfg ClickHouseConfig) (*ClickHouseWriter, error) {
 	return &ClickHouseWriter{conn: conn}, nil
 }
 
-// PrepareBatch delegates to the underlying driver connection.
-func (w *ClickHouseWriter) PrepareBatch(ctx context.Context, query string) (driver.Batch, error) {
-	return w.conn.PrepareBatch(ctx, query)
-}
+// InsertBatch writes messages to ClickHouse using explicit column-order Append
+// instead of AppendStruct, which avoids runtime failures on older clickhouse-go
+// v2 versions that don't implement the Struct scanner interface.
+//
+// The INSERT lists all columns explicitly so the order here must exactly match
+// the column list in the SQL string.
+func (w *ClickHouseWriter) InsertBatch(ctx context.Context, table string, messages []ProcessedMessage) error {
+	query := fmt.Sprintf(`
+		INSERT INTO %s (
+			event_id, trace_id, vehicle_id, organization_id,
+			latitude, longitude, altitude, speed, heading, hdop,
+			satellites, fix_status, rain, event_type,
+			movement_filtered, distance_from_last, time_since_last,
+			vehicle_plate, route_id, driver_id, conductor_id, capacity,
+			raw_message, schema_version,
+			device_timestamp, received_at, processed_at, recorded_at
+		)`, table)
 
-// ClickHouseRow is the struct inserted into the gps_events table.
-// Field names and `ch:` tags match the ClickHouse schema exactly.
-type ClickHouseRow struct {
-	EventID          string    `ch:"event_id"`
-	TraceID          string    `ch:"trace_id"`
-	VehicleID        string    `ch:"vehicle_id"`
-	OrganizationID   string    `ch:"organization_id"`
-	Latitude         float64   `ch:"latitude"`
-	Longitude        float64   `ch:"longitude"`
-	Altitude         int16     `ch:"altitude"`
-	Speed            int16     `ch:"speed"`
-	Heading          int16     `ch:"heading"`
-	HDOP             float32   `ch:"hdop"`
-	Satellites       int8      `ch:"satellites"`
-	FixStatus        string    `ch:"fix_status"`
-	Rain             bool      `ch:"rain"`
-	EventType        string    `ch:"event_type"`
-	MovementFiltered bool      `ch:"movement_filtered"`
-	DistanceFromLast float32   `ch:"distance_from_last"`
-	TimeSinceLast    int32     `ch:"time_since_last"`
-	VehiclePlate     string    `ch:"vehicle_plate"`
-	RouteID          string    `ch:"route_id"`
-	DriverID         string    `ch:"driver_id"`
-	ConductorID      string    `ch:"conductor_id"`
-	Capacity         int8      `ch:"capacity"`
-	RawMessage       string    `ch:"raw_message"`
-	SchemaVersion    int8      `ch:"schema_version"`
-	DeviceTimestamp  time.Time `ch:"device_timestamp"`
-	ReceivedAt       time.Time `ch:"received_at"`
-	ProcessedAt      time.Time `ch:"processed_at"`
-	RecordedAt       time.Time `ch:"recorded_at"`
+	batch, err := w.conn.PrepareBatch(ctx, query)
+	if err != nil {
+		return fmt.Errorf("PrepareBatch: %w", err)
+	}
+
+	now := time.Now().UTC()
+	for _, msg := range messages {
+		if err := batch.Append(
+			msg.EventID,
+			msg.TraceID,
+			msg.VehicleID,
+			msg.OrgID,
+			msg.Latitude,
+			msg.Longitude,
+			msg.Altitude,
+			msg.Speed,
+			msg.Heading,
+			msg.HDOP,
+			msg.Satellites,
+			msg.FixStatus,
+			msg.Rain,
+			msg.EventType,
+			msg.MovementFiltered,
+			msg.DistanceFromLast,
+			msg.TimeSinceLast,
+			msg.VehiclePlate,
+			msg.RouteID,
+			msg.DriverID,
+			msg.ConductorID,
+			msg.Capacity,
+			msg.RawMessage,
+			msg.SchemaVersion,
+			msg.DeviceTimestamp,
+			msg.ReceivedAt,
+			now, // processed_at
+			now, // recorded_at
+		); err != nil {
+			// Log the individual row error but continue — a single bad row should
+			// not abort the entire batch; the caller decides on DLQ routing.
+			log.Printf("[batch-writer] batch.Append vehicle=%s: %v", msg.VehicleID, err)
+		}
+	}
+
+	if err := batch.Send(); err != nil {
+		return fmt.Errorf("batch.Send: %w", err)
+	}
+	return nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ProcessedMessage — the in-process representation of a GPS event that has
-// been read from Redis and is ready to be written to ClickHouse.
+// Domain types
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ProcessedMessage is the in-process GPS event representation.
+// Stream/RedisID are the Redis provenance, used for XAck.
+// Attempts tracks DLQ retry history.
 type ProcessedMessage struct {
-	// Redis provenance — used for XAck after a successful ClickHouse write.
-	Stream  string
-	RedisID string
+	Stream   string
+	RedisID  string
+	Attempts int // incremented on each DLQ retry
 
-	// GPS event fields — match ClickHouseRow 1:1.
 	EventID          string
 	TraceID          string
 	VehicleID        string
@@ -205,7 +368,7 @@ type ProcessedMessage struct {
 }
 
 // wireEvent is the JSON payload stored in each Redis stream entry.
-// Tags match the field names written by mqtt-consumer.
+// Tags match field names written by mqtt-consumer.
 type wireEvent struct {
 	EventID          string  `json:"event_id"`
 	TraceID          string  `json:"trace_id"`
@@ -235,26 +398,20 @@ type wireEvent struct {
 	ReceivedAt       int64   `json:"received_at_ms"`
 }
 
-// deserialiseMessage converts a raw RedisMessage into a ProcessedMessage.
-// Redis stream values are map[string]interface{} where every value is actually
-// a string — the payload field carries the JSON-encoded event.
 func deserialiseMessage(msg RedisMessage) (ProcessedMessage, error) {
 	payloadRaw, ok := msg.Values["payload"]
 	if !ok {
-		return ProcessedMessage{}, fmt.Errorf("missing 'payload' field in stream entry %s", msg.ID)
+		return ProcessedMessage{}, fmt.Errorf("missing 'payload' field in entry %s", msg.ID)
 	}
-
 	payloadStr, ok := payloadRaw.(string)
 	if !ok {
-		return ProcessedMessage{}, fmt.Errorf("payload is not a string in entry %s", msg.ID)
+		return ProcessedMessage{}, fmt.Errorf("payload not a string in entry %s", msg.ID)
 	}
 
 	var we wireEvent
 	if err := json.Unmarshal([]byte(payloadStr), &we); err != nil {
 		return ProcessedMessage{}, fmt.Errorf("json unmarshal entry %s: %w", msg.ID, err)
 	}
-
-	// Assign a new event_id if the producer did not set one.
 	if we.EventID == "" {
 		we.EventID = uuid.NewString()
 	}
@@ -293,58 +450,66 @@ func deserialiseMessage(msg RedisMessage) (ProcessedMessage, error) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DLQ Processor
+//
+// Lifecycle:
+//   ingestLoop  — drains msgChan, writes entries to gps:dlq:{orgId} streams.
+//   retryLoop   — periodically reads from DLQ streams, re-attempts ClickHouse
+//                 insert, XAcks on success; increments attempts and re-queues
+//                 on failure; drops and XAcks after MaxRetries.
+//
+// dlqDepth gauge is backed by metrics.dlqDepthCount (atomic.Int64) so we can
+// call Set() accurately without racy Add-only increments.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// DLQProcessor receives messages that failed ClickHouse insertion or
-// deserialisation, writes them to the Redis DLQ stream, and periodically
-// retries them up to DLQConfig.MaxRetries times.
 type DLQProcessor struct {
-	config      DLQConfig
+	cfgHolder   *ConfigHolder
 	redisClient *redis.ClusterClient
+	chWriter    *ClickHouseWriter
 	metrics     *BatchWriterMetrics
-
-	mu       sync.Mutex
-	pending  []ProcessedMessage
 
 	msgChan  chan []ProcessedMessage
 	stopChan chan struct{}
 	wg       sync.WaitGroup
 }
 
-func NewDLQProcessor(cfg DLQConfig, redisClient *redis.ClusterClient, metrics *BatchWriterMetrics) *DLQProcessor {
+func NewDLQProcessor(
+	cfgHolder *ConfigHolder,
+	rdb *redis.ClusterClient,
+	chWriter *ClickHouseWriter,
+	metrics *BatchWriterMetrics,
+) *DLQProcessor {
 	return &DLQProcessor{
-		config:      cfg,
-		redisClient: redisClient,
+		cfgHolder:   cfgHolder,
+		redisClient: rdb,
+		chWriter:    chWriter,
 		metrics:     metrics,
 		msgChan:     make(chan []ProcessedMessage, 256),
 		stopChan:    make(chan struct{}),
 	}
 }
 
-// AddMessages enqueues messages for DLQ processing (non-blocking).
+// AddMessages enqueues messages for DLQ ingestion (non-blocking).
 func (d *DLQProcessor) AddMessages(messages []ProcessedMessage) {
 	select {
 	case d.msgChan <- messages:
 	default:
-		log.Printf("[batch-writer/dlq] channel full, dropping %d messages", len(messages))
+		log.Printf("[batch-writer/dlq] channel full — dropping %d messages", len(messages))
 	}
-	d.metrics.dlqSize.Add(float64(len(messages)))
 }
 
-// Start launches the ingest and retry workers.
 func (d *DLQProcessor) Start() {
 	d.wg.Add(2)
 	go d.ingestLoop()
 	go d.retryLoop()
 }
 
-// Stop signals workers to finish and waits for them.
 func (d *DLQProcessor) Stop() {
 	close(d.stopChan)
 	d.wg.Wait()
 }
 
-// ingestLoop drains msgChan and writes events to the Redis DLQ stream.
+// ingestLoop writes failed messages to their per-org DLQ stream.
+// It also maintains dlqDepthCount so the gauge reflects actual DLQ depth.
 func (d *DLQProcessor) ingestLoop() {
 	defer d.wg.Done()
 	for {
@@ -352,32 +517,45 @@ func (d *DLQProcessor) ingestLoop() {
 		case <-d.stopChan:
 			return
 		case msgs := <-d.msgChan:
+			cfg := d.cfgHolder.Get()
 			for _, msg := range msgs {
 				payload, _ := json.Marshal(msg)
-				streamKey := fmt.Sprintf("gps:dlq:%s", msg.OrgID)
+				streamKey := cfg.Redis.Streams.DLQPrefix + msg.OrgID
 				err := d.redisClient.XAdd(context.Background(), &redis.XAddArgs{
 					Stream: streamKey,
-					MaxLen: int64(d.config.Processing.BatchSize * 10),
+					MaxLen: int64(cfg.DLQ.BatchSize * 20),
 					Approx: true,
 					Values: map[string]interface{}{
 						"payload":  string(payload),
-						"attempts": "1",
+						"attempts": msg.Attempts + 1,
 					},
 				}).Err()
 				if err != nil {
-					log.Printf("[batch-writer/dlq] XAdd error: %v", err)
+					log.Printf("[batch-writer/dlq] XAdd stream=%s: %v", streamKey, err)
+					continue
 				}
+				d.metrics.dlqIngested.Inc()
+				n := d.metrics.dlqDepthCount.Add(1)
+				d.metrics.dlqDepth.Set(float64(n))
 			}
 		}
 	}
 }
 
-// retryLoop periodically re-reads from the DLQ stream and re-queues events
-// for the main batch processor (simplified — full retry would re-call
-// writeToClickhouse directly; left as a hook for the operator).
+// retryLoop periodically reads from DLQ streams and retries ClickHouse inserts.
+//
+// Per-message outcomes:
+//   - Success          → XAck from DLQ stream, decrement depth counter, inc dlqRetried
+//   - Failure, attempts < MaxRetries → XAck + re-push with Attempts+1 via AddMessages
+//   - Failure, attempts >= MaxRetries → XAck (remove from DLQ), inc dlqDropped, log
+//
+// Using XAck-then-re-push (rather than leaving un-acked) avoids the PEL growing
+// unboundedly when consumers restart. The attempt counter in the payload is the
+// retry ledger.
 func (d *DLQProcessor) retryLoop() {
 	defer d.wg.Done()
-	ticker := time.NewTicker(d.config.RetryInterval)
+	cfg := d.cfgHolder.Get()
+	ticker := time.NewTicker(cfg.DLQ.RetryInterval)
 	defer ticker.Stop()
 
 	for {
@@ -385,29 +563,158 @@ func (d *DLQProcessor) retryLoop() {
 		case <-d.stopChan:
 			return
 		case <-ticker.C:
-			log.Printf("[batch-writer/dlq] retry tick — DLQ size gauge: %.0f", d.gaugeValue())
-			// Full retry implementation: read from gps:dlq:*, deserialise,
-			// attempt ClickHouse insert, XAck or increment attempts counter.
-			// Omitted here to keep the file focused; wire in your retry logic.
+			d.processDLQBatch()
 		}
 	}
 }
 
-func (d *DLQProcessor) gaugeValue() float64 {
-	// Prometheus gauge doesn't expose Get(); use an internal counter instead
-	// of reflection. Placeholder until a dedicated atomic counter is added.
-	return 0
+func (d *DLQProcessor) processDLQBatch() {
+	cfg := d.cfgHolder.Get()
+	ctx := context.Background()
+
+	// Discover DLQ streams the same way StreamRegistry discovers batch streams.
+	pattern := cfg.Redis.Streams.DLQPrefix + "*"
+	dlqStreams := d.scanDLQStreams(ctx, pattern)
+	if len(dlqStreams) == 0 {
+		return
+	}
+
+	// Ensure consumer group exists for each DLQ stream.
+	dlqGroup := cfg.Redis.ConsumerGroup + "-dlq"
+	for _, stream := range dlqStreams {
+		err := d.redisClient.XGroupCreateMkStream(ctx, stream, dlqGroup, "0").Err()
+		if err != nil && !isGroupExistsErr(err) {
+			log.Printf("[batch-writer/dlq] XGroupCreateMkStream stream=%s: %v", stream, err)
+		}
+	}
+
+	// Build XReadGroup args for all DLQ streams.
+	streamArgs := make([]string, 0, len(dlqStreams)*2)
+	streamArgs = append(streamArgs, dlqStreams...)
+	for range dlqStreams {
+		streamArgs = append(streamArgs, ">")
+	}
+
+	result, err := d.redisClient.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    dlqGroup,
+		Consumer: cfg.Redis.ConsumerName + "-dlq",
+		Streams:  streamArgs,
+		Count:    int64(cfg.DLQ.BatchSize),
+		Block:    0, // non-blocking: return immediately if no messages
+		NoAck:    false,
+	}).Result()
+	if err != nil {
+		if err != redis.Nil {
+			log.Printf("[batch-writer/dlq] XReadGroup: %v", err)
+		}
+		return
+	}
+
+	for _, sr := range result {
+		for _, m := range sr.Messages {
+			d.retryOne(ctx, sr.Stream, m, dlqGroup, cfg)
+		}
+	}
+}
+
+func (d *DLQProcessor) retryOne(
+	ctx context.Context,
+	stream string,
+	m redis.XMessage,
+	group string,
+	cfg *Config,
+) {
+	// Deserialise the DLQ entry back into a ProcessedMessage.
+	payloadRaw, ok := m.Values["payload"]
+	if !ok {
+		log.Printf("[batch-writer/dlq] entry %s missing payload — dropping", m.ID)
+		d.ackDLQ(ctx, stream, group, m.ID)
+		d.decrementDepth()
+		return
+	}
+	payloadStr, _ := payloadRaw.(string)
+
+	var msg ProcessedMessage
+	if err := json.Unmarshal([]byte(payloadStr), &msg); err != nil {
+		log.Printf("[batch-writer/dlq] unmarshal entry %s: %v — dropping", m.ID, err)
+		d.ackDLQ(ctx, stream, group, m.ID)
+		d.decrementDepth()
+		return
+	}
+
+	// Attach the DLQ stream provenance so ackDLQ can target the right stream.
+	msg.Stream = stream
+	msg.RedisID = m.ID
+
+	// Attempt ClickHouse insert.
+	err := d.chWriter.InsertBatch(ctx, cfg.ClickHouse.Table, []ProcessedMessage{msg})
+
+	// Always XAck the DLQ entry first — whether we succeed or re-queue.
+	// This keeps the PEL clean regardless of outcome.
+	d.ackDLQ(ctx, stream, group, m.ID)
+	d.decrementDepth()
+
+	if err == nil {
+		d.metrics.dlqRetried.Inc()
+		return
+	}
+
+	// Insert failed.
+	msg.Attempts++
+	if msg.Attempts >= cfg.DLQ.MaxRetries {
+		log.Printf("[batch-writer/dlq] permanently dropping vehicle=%s event=%s after %d attempts: %v",
+			msg.VehicleID, msg.EventID, msg.Attempts, err)
+		d.metrics.dlqDropped.Inc()
+		return
+	}
+
+	// Re-queue with incremented attempt counter.
+	log.Printf("[batch-writer/dlq] re-queuing vehicle=%s event=%s attempt=%d: %v",
+		msg.VehicleID, msg.EventID, msg.Attempts, err)
+	d.AddMessages([]ProcessedMessage{msg})
+}
+
+func (d *DLQProcessor) ackDLQ(ctx context.Context, stream, group, id string) {
+	if err := d.redisClient.XAck(ctx, stream, group, id).Err(); err != nil {
+		log.Printf("[batch-writer/dlq] XAck stream=%s id=%s: %v", stream, id, err)
+	}
+}
+
+func (d *DLQProcessor) decrementDepth() {
+	n := d.metrics.dlqDepthCount.Add(-1)
+	if n < 0 {
+		// Guard against underflow if a message was counted before the atomic was initialised.
+		d.metrics.dlqDepthCount.Store(0)
+		n = 0
+	}
+	d.metrics.dlqDepth.Set(float64(n))
+}
+
+func (d *DLQProcessor) scanDLQStreams(ctx context.Context, pattern string) []string {
+	var keys []string
+	iter := d.redisClient.Scan(ctx, 0, pattern, 0).Iterator()
+	for iter.Next(ctx) {
+		keys = append(keys, iter.Val())
+	}
+	if err := iter.Err(); err != nil {
+		log.Printf("[batch-writer/dlq] SCAN %s: %v", pattern, err)
+	}
+	return keys
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helpers shared with main.go
+// Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-func extractOrgID(stream string) string {
-	// Stream key format: gps:batch:{orgId}
-	idx := strings.LastIndex(stream, ":")
-	if idx < 0 || idx == len(stream)-1 {
-		return ""
+// extractOrgID returns the orgId suffix from a stream key given its prefix.
+// e.g. extractOrgID("gps:batch:org-42", "gps:batch:") → "org-42"
+func extractOrgID(stream, prefix string) string {
+	return strings.TrimPrefix(stream, prefix)
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-	return stream[idx+1:]
+	return def
 }

@@ -1,10 +1,10 @@
 // batch-writer/main.go
-// All types, clients, and helpers live in internal.go (same package).
-// Fixes applied (scalability audit):
-//  1. All 7 Prometheus fields initialised before MustRegister.
-//  2. osGetenv → os.Getenv.
-//  3. BatchProcessor.config is full Config (was ProcessingConfig).
-//  4. Metrics port from METRICS_PORT env; /health endpoint added.
+//
+// Reads GPS events from Redis Streams, batches them, and inserts into
+// ClickHouse. Exposes /metrics (Prometheus) and /health for the orchestrator.
+//
+// Config precedence: ENV > orchestrator.yaml > coded defaults.
+// All env keys are prefixed BATCH_WRITER_ by Viper (e.g. BATCH_WRITER_REDIS_PASSWORD).
 package main
 
 import (
@@ -14,17 +14,20 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/redis/go-redis/v9"
+	redis "github.com/redis/go-redis/v9"
+	"github.com/spf13/viper"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Configuration
+// Config — Viper-backed, atomic ConfigHolder, 12-factor layering
 // ─────────────────────────────────────────────────────────────────────────────
 
 type Config struct {
@@ -46,13 +49,14 @@ type RedisConfig struct {
 }
 
 type RedisStreamConfig struct {
-	Batch string
-	DLQ   string
+	BatchPrefix string // e.g. "gps:batch:" — registry appends orgId
+	DLQPrefix   string // e.g. "gps:dlq:"
 }
 
 type RedisReadConfig struct {
-	BatchSize int64
-	BlockTime time.Duration
+	BatchSize           int64
+	BlockTime           time.Duration
+	StreamRefreshInterval time.Duration // how often StreamRegistry re-SCАNs for new orgs
 }
 
 type ClickHouseConfig struct {
@@ -66,49 +70,29 @@ type ClickHouseConfig struct {
 }
 
 type ClickHouseOptimization struct {
-	BatchSize       int
-	MaxRowsPerBatch int
-	FlushInterval   time.Duration
-	ParallelWrites  int
-	Compression     string
+	BatchSize     int
+	FlushInterval time.Duration
+	Compression   string
 }
 
 type ClickHousePerformance struct {
-	MaxRetries     int
-	RetryBackoff   time.Duration
-	ConnectionPool ConnectionPool
-}
-
-type ConnectionPool struct {
-	MaxOpen     int
-	MaxIdle     int
-	MaxLifetime time.Duration
+	MaxRetries   int
+	RetryBackoff time.Duration
+	MaxOpen      int
+	MaxIdle      int
+	MaxLifetime  time.Duration
 }
 
 type ProcessingConfig struct {
-	Workers         int
-	BufferSize      int
-	BatchProcessing BatchProcessing
-}
-
-type BatchProcessing struct {
-	MaxBatchRows      int
-	MaxBatchSizeBytes int
-	OrgBatchSize      int
-	TimeBatchWindow   time.Duration
+	Workers    int
+	BufferSize int
 }
 
 type DLQConfig struct {
 	MaxRetries    int
 	RetryInterval time.Duration
 	MaxAgeDays    int
-	Processing    DLQProcessing
-}
-
-type DLQProcessing struct {
-	Workers   int
-	BatchSize int
-	Interval  time.Duration
+	BatchSize     int
 }
 
 type MetricsConfig struct {
@@ -116,113 +100,196 @@ type MetricsConfig struct {
 	Path string
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Config
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── ConfigHolder — immutable snapshot + atomic swap, zero mutexes ──────────
 
-func loadConfig() Config {
-	instanceID  := envOr("INSTANCE_ID", "batch-writer-0")
-	metricsPort := envInt("METRICS_PORT", 9090)
+type ConfigHolder struct {
+	val atomic.Value // stores *Config
+}
 
-	return Config{
+func NewConfigHolder(cfg *Config) *ConfigHolder {
+	h := &ConfigHolder{}
+	h.val.Store(cfg)
+	return h
+}
+
+func (h *ConfigHolder) Get() *Config { return h.val.Load().(*Config) }
+func (h *ConfigHolder) Set(cfg *Config) { h.val.Store(cfg) }
+
+// ─── Viper loader ────────────────────────────────────────────────────────────
+
+func loadConfig() (*Config, error) {
+	v := viper.New()
+
+	v.AutomaticEnv()
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.SetEnvPrefix("BATCH_WRITER")
+
+	v.SetConfigName("batch-writer")
+	v.SetConfigType("yaml")
+	v.AddConfigPath(".")
+	v.AddConfigPath("/etc/matatu-pulse")
+	_ = v.ReadInConfig()
+
+	instanceID := os.Getenv("INSTANCE_ID")
+	if instanceID == "" {
+		instanceID = "batch-writer-0"
+	}
+
+	// ── defaults ─────────────────────────────────────────────────────────────
+	v.SetDefault("redis.cluster", true)
+	v.SetDefault("redis.nodes", []string{"redis-01:6379", "redis-02:6379", "redis-03:6379"})
+	v.SetDefault("redis.consumer_group", "batch-writers")
+	v.SetDefault("redis.streams.batch_prefix", "gps:batch:")
+	v.SetDefault("redis.streams.dlq_prefix", "gps:dlq:")
+	v.SetDefault("redis.read.batch_size", 10000)
+	v.SetDefault("redis.read.block_time", "5s")
+	v.SetDefault("redis.read.stream_refresh_interval", "30s")
+
+	v.SetDefault("clickhouse.database", "default")
+	v.SetDefault("clickhouse.table", "gps_events")
+	v.SetDefault("clickhouse.optimization.batch_size", 10000)
+	v.SetDefault("clickhouse.optimization.flush_interval", "5s")
+	v.SetDefault("clickhouse.optimization.compression", "lz4")
+	v.SetDefault("clickhouse.performance.max_retries", 3)
+	v.SetDefault("clickhouse.performance.retry_backoff", "1s")
+	v.SetDefault("clickhouse.performance.max_open", 20)
+	v.SetDefault("clickhouse.performance.max_idle", 10)
+	v.SetDefault("clickhouse.performance.max_lifetime", "5m")
+
+	v.SetDefault("processing.workers", 4)
+	v.SetDefault("processing.buffer_size", 50000)
+
+	v.SetDefault("dlq.max_retries", 3)
+	v.SetDefault("dlq.retry_interval", "60s")
+	v.SetDefault("dlq.max_age_days", 7)
+	v.SetDefault("dlq.batch_size", 1000)
+
+	metricsPort := 9090
+	if p := os.Getenv("METRICS_PORT"); p != "" {
+		if n,err := strconv.Atoi(p); err == nil && n > 0 {
+			metricsPort = n
+		}
+	}
+	v.SetDefault("metrics.port", metricsPort)
+	v.SetDefault("metrics.path", "/metrics")
+
+	cfg := &Config{
 		Redis: RedisConfig{
-			Cluster:       true,
-			Nodes:         []string{"redis-01:6379", "redis-02:6379", "redis-03:6379"},
-			Password:      os.Getenv("REDIS_PASSWORD"), // FIX: was osGetenv
-			ConsumerGroup: "batch-writers",
-			ConsumerName:  instanceID,                  // FIX: unique per replica
+			Cluster:       v.GetBool("redis.cluster"),
+			Nodes:         v.GetStringSlice("redis.nodes"),
+			Password:      v.GetString("redis.password"),
+			ConsumerGroup: v.GetString("redis.consumer_group"),
+			ConsumerName:  instanceID,
 			Streams: RedisStreamConfig{
-				Batch: "gps:batch:{orgId}",
-				DLQ:   "gps:dlq:{orgId}",
+				BatchPrefix: v.GetString("redis.streams.batch_prefix"),
+				DLQPrefix:   v.GetString("redis.streams.dlq_prefix"),
 			},
 			ReadConfig: RedisReadConfig{
-				BatchSize: 10000,
-				BlockTime: 5 * time.Second,
+				BatchSize:             v.GetInt64("redis.read.batch_size"),
+				BlockTime:             v.GetDuration("redis.read.block_time"),
+				StreamRefreshInterval: v.GetDuration("redis.read.stream_refresh_interval"),
 			},
 		},
 		ClickHouse: ClickHouseConfig{
-			Host:     os.Getenv("CLICKHOUSE_HOST"),
-			Username: os.Getenv("CLICKHOUSE_USERNAME"),
-			Password: os.Getenv("CLICKHOUSE_PASSWORD"),
-			Database: "default",
-			Table:    "gps_events",
+			Host:     v.GetString("clickhouse.host"),
+			Username: v.GetString("clickhouse.username"),
+			Password: v.GetString("clickhouse.password"),
+			Database: v.GetString("clickhouse.database"),
+			Table:    v.GetString("clickhouse.table"),
 			Optimization: ClickHouseOptimization{
-				BatchSize:       10000,
-				MaxRowsPerBatch: 100000,
-				FlushInterval:   5 * time.Second,
-				ParallelWrites:  4,
-				Compression:     "lz4",
+				BatchSize:     v.GetInt("clickhouse.optimization.batch_size"),
+				FlushInterval: v.GetDuration("clickhouse.optimization.flush_interval"),
+				Compression:   v.GetString("clickhouse.optimization.compression"),
 			},
 			Performance: ClickHousePerformance{
-				MaxRetries:   3,
-				RetryBackoff: 1 * time.Second,
-				ConnectionPool: ConnectionPool{
-					MaxOpen:     20,
-					MaxIdle:     10,
-					MaxLifetime: 5 * time.Minute,
-				},
+				MaxRetries:   v.GetInt("clickhouse.performance.max_retries"),
+				RetryBackoff: v.GetDuration("clickhouse.performance.retry_backoff"),
+				MaxOpen:      v.GetInt("clickhouse.performance.max_open"),
+				MaxIdle:      v.GetInt("clickhouse.performance.max_idle"),
+				MaxLifetime:  v.GetDuration("clickhouse.performance.max_lifetime"),
 			},
 		},
 		Processing: ProcessingConfig{
-			Workers:    4,
-			BufferSize: 50000,
-			BatchProcessing: BatchProcessing{
-				MaxBatchRows:      10000,
-				MaxBatchSizeBytes: 10485760,
-				OrgBatchSize:      1000,
-				TimeBatchWindow:   5 * time.Second,
-			},
+			Workers:    v.GetInt("processing.workers"),
+			BufferSize: v.GetInt("processing.buffer_size"),
 		},
 		DLQ: DLQConfig{
-			MaxRetries:    3,
-			RetryInterval: 60 * time.Second,
-			MaxAgeDays:    7,
-			Processing: DLQProcessing{
-				Workers:   2,
-				BatchSize: 1000,
-				Interval:  300 * time.Second,
-			},
+			MaxRetries:    v.GetInt("dlq.max_retries"),
+			RetryInterval: v.GetDuration("dlq.retry_interval"),
+			MaxAgeDays:    v.GetInt("dlq.max_age_days"),
+			BatchSize:     v.GetInt("dlq.batch_size"),
 		},
 		Metrics: MetricsConfig{
-			Port: metricsPort, // FIX: from env, not hard-coded 9090
-			Path: "/metrics",
+			Port: v.GetInt("metrics.port"),
+			Path: v.GetString("metrics.path"),
 		},
 	}
+
+	// ── validation ───────────────────────────────────────────────────────────
+	if len(cfg.Redis.Nodes) == 0 {
+		return nil, fmt.Errorf("redis.nodes must not be empty")
+	}
+	if cfg.ClickHouse.Host == "" {
+		return nil, fmt.Errorf("BATCH_WRITER_CLICKHOUSE_HOST is required")
+	}
+	if cfg.Processing.Workers < 1 {
+		return nil, fmt.Errorf("processing.workers must be >= 1")
+	}
+
+	return cfg, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Prometheus metrics
-// FIX: all 7 fields initialised before MustRegister (4 were nil → panic)
 // ─────────────────────────────────────────────────────────────────────────────
 
+// BatchWriterMetrics groups all Prometheus instruments for this service.
+// dlqDepth is backed by an atomic int64 so AddMessages/XAck can do real Set()
+// calls on the gauge without exposing the gauge directly to concurrent writers.
 type BatchWriterMetrics struct {
-	redisStreamLag     prometheus.Gauge
-	batchWriteDuration prometheus.Histogram
-	rowsInserted       prometheus.Counter
-	dlqSize            prometheus.Gauge     // was nil
-	clickhouseErrors   prometheus.Counter   // was nil
-	redisReadErrors    prometheus.Counter   // was nil
-	batchSize          prometheus.Histogram // was nil
+	// Gauges
+	redisStreamLag prometheus.Gauge // actual XPENDING count — see measureLag()
+	dlqDepth       prometheus.Gauge // real DLQ depth (Set by DLQProcessor)
+
+	// Histograms
+	batchWriteDuration prometheus.Histogram // ms per ClickHouse INSERT
+	batchSizeRows      prometheus.Histogram // rows per INSERT
+
+	// Counters
+	rowsInserted     prometheus.Counter
+	clickhouseErrors prometheus.Counter
+	redisReadErrors  prometheus.Counter
+	dlqIngested      prometheus.Counter // messages pushed into DLQ (ever)
+	dlqRetried       prometheus.Counter // messages successfully retried out of DLQ
+	dlqDropped       prometheus.Counter // messages abandoned after MaxRetries
+
+	// Internal atomic — DLQProcessor uses this so it can Set() dlqDepth safely.
+	dlqDepthCount atomic.Int64
 }
 
 func NewBatchWriterMetrics() *BatchWriterMetrics {
 	m := &BatchWriterMetrics{
 		redisStreamLag: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "batch_writer_redis_stream_lag",
-			Help: "Messages lagging in Redis streams",
+			Help: "Total pending messages across all tracked Redis streams (XPENDING sum)",
+		}),
+		dlqDepth: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "batch_writer_dlq_depth",
+			Help: "Current number of messages sitting in the DLQ stream(s)",
 		}),
 		batchWriteDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "batch_writer_batch_write_duration_ms",
-			Help:    "ClickHouse batch write duration ms",
+			Help:    "ClickHouse batch write duration in milliseconds",
 			Buckets: []float64{10, 50, 100, 500, 1000, 5000, 10000},
+		}),
+		batchSizeRows: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "batch_writer_batch_size_rows",
+			Help:    "Number of rows per ClickHouse INSERT batch",
+			Buckets: []float64{100, 500, 1000, 2500, 5000, 10000, 50000},
 		}),
 		rowsInserted: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "batch_writer_rows_inserted_total",
-			Help: "Rows inserted to ClickHouse",
-		}),
-		dlqSize: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "batch_writer_dlq_size",
-			Help: "Current DLQ depth",
+			Help: "Total rows successfully inserted into ClickHouse",
 		}),
 		clickhouseErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "batch_writer_clickhouse_errors_total",
@@ -230,49 +297,66 @@ func NewBatchWriterMetrics() *BatchWriterMetrics {
 		}),
 		redisReadErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "batch_writer_redis_read_errors_total",
-			Help: "Redis read errors",
+			Help: "Redis XReadGroup errors",
 		}),
-		batchSize: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Name:    "batch_writer_batch_size",
-			Help:    "Rows per INSERT batch",
-			Buckets: []float64{100, 500, 1000, 2500, 5000, 10000, 50000},
+		dlqIngested: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "batch_writer_dlq_ingested_total",
+			Help: "Total messages ever pushed into the DLQ",
+		}),
+		dlqRetried: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "batch_writer_dlq_retried_total",
+			Help: "Messages successfully retried out of the DLQ",
+		}),
+		dlqDropped: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "batch_writer_dlq_dropped_total",
+			Help: "Messages abandoned after MaxRetries",
 		}),
 	}
+
 	prometheus.MustRegister(
-		m.redisStreamLag, m.batchWriteDuration, m.rowsInserted,
-		m.dlqSize, m.clickhouseErrors, m.redisReadErrors, m.batchSize,
+		m.redisStreamLag,
+		m.dlqDepth,
+		m.batchWriteDuration,
+		m.batchSizeRows,
+		m.rowsInserted,
+		m.clickhouseErrors,
+		m.redisReadErrors,
+		m.dlqIngested,
+		m.dlqRetried,
+		m.dlqDropped,
 	)
 	return m
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Batch Processor
-// FIX: config field is now full Config (was ProcessingConfig) so
-// readBatchFromRedis can reach config.Redis.*
+// BatchProcessor
 // ─────────────────────────────────────────────────────────────────────────────
 
 type BatchProcessor struct {
+	cfgHolder    *ConfigHolder
 	redisClient  *redis.ClusterClient
-	chWriter     *ClickHouseWriter // defined in internal.go
-	dlqProcessor *DLQProcessor     // defined in internal.go
+	chWriter     *ClickHouseWriter
+	dlqProcessor *DLQProcessor
 	metrics      *BatchWriterMetrics
-	config       Config // FIX: was ProcessingConfig
+	registry     *StreamRegistry
 	stopChan     chan struct{}
 }
 
 func NewBatchProcessor(
-	config Config, // FIX: was ProcessingConfig
+	cfgHolder *ConfigHolder,
 	rdb *redis.ClusterClient,
 	chWriter *ClickHouseWriter,
 	dlq *DLQProcessor,
 	metrics *BatchWriterMetrics,
+	registry *StreamRegistry,
 ) *BatchProcessor {
 	return &BatchProcessor{
+		cfgHolder:    cfgHolder,
 		redisClient:  rdb,
 		chWriter:     chWriter,
 		dlqProcessor: dlq,
 		metrics:      metrics,
-		config:       config,
+		registry:     registry,
 		stopChan:     make(chan struct{}),
 	}
 }
@@ -303,13 +387,16 @@ func (p *BatchProcessor) processBatchLoop() {
 		processed, failed := p.processBatch(messages)
 
 		if len(processed) > 0 {
-			if err = p.writeToClickhouse(processed); err != nil {
+			cfg := p.cfgHolder.Get()
+			if err = p.writeToClickhouse(processed, cfg.ClickHouse.Table); err != nil {
 				p.metrics.clickhouseErrors.Inc()
+				log.Printf("[batch-writer] ClickHouse write failed (%d rows): %v", len(processed), err)
 				p.dlqProcessor.AddMessages(processed)
 			} else {
 				p.ackRedisMessages(processed)
 				p.metrics.rowsInserted.Add(float64(len(processed)))
 				p.metrics.batchWriteDuration.Observe(float64(time.Since(start).Milliseconds()))
+				p.metrics.batchSizeRows.Observe(float64(len(processed)))
 			}
 		}
 		if len(failed) > 0 {
@@ -319,17 +406,25 @@ func (p *BatchProcessor) processBatchLoop() {
 }
 
 func (p *BatchProcessor) readBatchFromRedis() ([]RedisMessage, error) {
-	// FIX: p.config is full Config — p.config.Redis.* is now reachable.
-	args := redis.XReadGroupArgs{
-		Group:    p.config.Redis.ConsumerGroup,
-		Consumer: p.config.Redis.ConsumerName,
-		Streams:  []string{"gps:batch:*", ">"},
-		Count:    p.config.Redis.ReadConfig.BatchSize,
-		Block:    p.config.Redis.ReadConfig.BlockTime,
+	cfg := p.cfgHolder.Get()
+
+	// StreamRegistry returns only known-good, explicit stream keys.
+	// This replaces the broken "gps:batch:*" glob — see StreamRegistry.
+	streams := p.registry.StreamArgs()
+	if len(streams) == 0 {
+		return nil, nil // no org streams discovered yet
+	}
+
+	args := &redis.XReadGroupArgs{
+		Group:    cfg.Redis.ConsumerGroup,
+		Consumer: cfg.Redis.ConsumerName,
+		Streams:  streams,
+		Count:    cfg.Redis.ReadConfig.BatchSize,
+		Block:    cfg.Redis.ReadConfig.BlockTime,
 		NoAck:    false,
 	}
 
-	result, err := p.redisClient.XReadGroup(context.Background(), &args).Result()
+	result, err := p.redisClient.XReadGroup(context.Background(), args).Result()
 	if err != nil {
 		if err == redis.Nil {
 			return nil, nil
@@ -337,7 +432,8 @@ func (p *BatchProcessor) readBatchFromRedis() ([]RedisMessage, error) {
 		return nil, err
 	}
 
-	p.metrics.redisStreamLag.Set(float64(len(result)))
+	// Measure real lag: sum XPENDING counts across all tracked streams.
+	go p.measureLag(cfg)
 
 	var msgs []RedisMessage
 	for _, sr := range result {
@@ -346,20 +442,40 @@ func (p *BatchProcessor) readBatchFromRedis() ([]RedisMessage, error) {
 				Stream: sr.Stream,
 				ID:     m.ID,
 				Values: m.Values,
-				OrgID:  extractOrgID(sr.Stream), // defined in internal.go
+				OrgID:  extractOrgID(sr.Stream, cfg.Redis.Streams.BatchPrefix),
 			})
 		}
 	}
 	return msgs, nil
 }
 
+// measureLag runs in a goroutine after each read — it sums XPENDING counts
+// across all tracked streams and updates the Prometheus gauge.
+func (p *BatchProcessor) measureLag(cfg *Config) {
+	keys := p.registry.Keys()
+	var total int64
+	for _, key := range keys {
+		pending, err := p.redisClient.XPending(
+			context.Background(), key, cfg.Redis.ConsumerGroup,
+		).Result()
+		if err == nil {
+			total += pending.Count
+		}
+	}
+	p.metrics.redisStreamLag.Set(float64(total))
+}
+
 func (p *BatchProcessor) processBatch(messages []RedisMessage) ([]ProcessedMessage, []ProcessedMessage) {
 	var ok, fail []ProcessedMessage
 	for _, msg := range messages {
-		pm, err := deserialiseMessage(msg) // defined in internal.go
+		pm, err := deserialiseMessage(msg)
 		if err != nil {
-			log.Printf("[batch-writer] deserialise id=%s: %v", msg.ID, err)
-			fail = append(fail, ProcessedMessage{Stream: msg.Stream, RedisID: msg.ID, OrgID: msg.OrgID})
+			log.Printf("[batch-writer] deserialise id=%s stream=%s: %v", msg.ID, msg.Stream, err)
+			fail = append(fail, ProcessedMessage{
+				Stream:  msg.Stream,
+				RedisID: msg.ID,
+				OrgID:   msg.OrgID,
+			})
 			continue
 		}
 		ok = append(ok, pm)
@@ -367,74 +483,27 @@ func (p *BatchProcessor) processBatch(messages []RedisMessage) ([]ProcessedMessa
 	return ok, fail
 }
 
-func (p *BatchProcessor) writeToClickhouse(messages []ProcessedMessage) error {
-	batch, err := p.chWriter.PrepareBatch(
-		context.Background(),
-		fmt.Sprintf("INSERT INTO %s", p.config.ClickHouse.Table),
-	)
-	if err != nil {
-		return err
-	}
-
-	now := time.Now()
-	for _, msg := range messages {
-		row := ClickHouseRow{ // defined in internal.go
-			EventID:          msg.EventID,
-			TraceID:          msg.TraceID,
-			VehicleID:        msg.VehicleID,
-			OrganizationID:   msg.OrgID,
-			Latitude:         msg.Latitude,
-			Longitude:        msg.Longitude,
-			Altitude:         msg.Altitude,
-			Speed:            msg.Speed,
-			Heading:          msg.Heading,
-			HDOP:             msg.HDOP,
-			Satellites:       msg.Satellites,
-			FixStatus:        msg.FixStatus,
-			Rain:             msg.Rain,
-			EventType:        msg.EventType,
-			MovementFiltered: msg.MovementFiltered,
-			DistanceFromLast: msg.DistanceFromLast,
-			TimeSinceLast:    msg.TimeSinceLast,
-			VehiclePlate:     msg.VehiclePlate,
-			RouteID:          msg.RouteID,
-			DriverID:         msg.DriverID,
-			ConductorID:      msg.ConductorID,
-			Capacity:         msg.Capacity,
-			RawMessage:       msg.RawMessage,
-			SchemaVersion:    msg.SchemaVersion,
-			DeviceTimestamp:  msg.DeviceTimestamp,
-			ReceivedAt:       msg.ReceivedAt,
-			ProcessedAt:      now,
-			RecordedAt:       now,
-		}
-		if err := batch.AppendStruct(row); err != nil {
-			log.Printf("[batch-writer] append vehicle=%s: %v", msg.VehicleID, err)
-		}
-	}
-
-	if err := batch.Send(); err != nil {
-		return err
-	}
-	p.metrics.batchSize.Observe(float64(len(messages)))
-	return nil
+func (p *BatchProcessor) writeToClickhouse(messages []ProcessedMessage, table string) error {
+	return p.chWriter.InsertBatch(context.Background(), table, messages)
 }
 
 func (p *BatchProcessor) ackRedisMessages(messages []ProcessedMessage) {
-	byStream := make(map[string][]string)
+	cfg := p.cfgHolder.Get()
+	byStream := make(map[string][]string, len(messages))
 	for _, m := range messages {
 		byStream[m.Stream] = append(byStream[m.Stream], m.RedisID)
 	}
 	for stream, ids := range byStream {
-		if err := p.redisClient.XAck(context.Background(), stream,
-			p.config.Redis.ConsumerGroup, ids...).Err(); err != nil {
-			log.Printf("[batch-writer] XAck stream=%s: %v", stream, err)
+		if err := p.redisClient.XAck(
+			context.Background(), stream, cfg.Redis.ConsumerGroup, ids...,
+		).Err(); err != nil {
+			log.Printf("[batch-writer] XAck stream=%s ids=%d: %v", stream, len(ids), err)
 		}
 	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Metrics + health server — FIX: port from METRICS_PORT env
+// Metrics + health server
 // ─────────────────────────────────────────────────────────────────────────────
 
 func startMetricsServer(cfg MetricsConfig) {
@@ -456,11 +525,15 @@ func startMetricsServer(cfg MetricsConfig) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func main() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	log.Println("[batch-writer] starting...")
 
-	cfg := loadConfig()
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("[batch-writer] config error: %v", err)
+	}
+	cfgHolder := NewConfigHolder(cfg)
 
-	// setupTracing is defined in internal.go and returns (func(ctx) error, error)
 	shutdown, err := setupTracing("batch-writer")
 	if err != nil {
 		log.Fatalf("[batch-writer] tracing: %v", err)
@@ -468,43 +541,40 @@ func main() {
 	defer shutdown(context.Background())
 
 	metrics  := NewBatchWriterMetrics()
-	rdb      := initRedisClusterClient(cfg.Redis) // internal.go
-	chWriter, err := NewClickHouseWriter(cfg.ClickHouse) // internal.go
+	rdb      := initRedisClusterClient(cfg.Redis)
+	chWriter, err := NewClickHouseWriter(cfg.ClickHouse)
 	if err != nil {
-		log.Fatalf("[batch-writer] ClickHouse: %v", err)
+		log.Fatalf("[batch-writer] ClickHouse init: %v", err)
 	}
 
-	dlq   := NewDLQProcessor(cfg.DLQ, rdb, metrics) // internal.go
-	batch := NewBatchProcessor(cfg, rdb, chWriter, dlq, metrics)
+	// StreamRegistry discovers "gps:batch:{orgId}" keys via SCAN and ensures
+	// consumer groups exist before BatchProcessor reads from them.
+	registry := NewStreamRegistry(rdb, cfg.Redis)
+	if err := registry.Bootstrap(context.Background()); err != nil {
+		log.Printf("[batch-writer] stream registry bootstrap warning: %v", err)
+	}
+
+	dlq   := NewDLQProcessor(cfgHolder, rdb, chWriter, metrics)
+	batch := NewBatchProcessor(cfgHolder, rdb, chWriter, dlq, metrics, registry)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	go startMetricsServer(cfg.Metrics)
+	go registry.Run(ctx)
 	batch.Start()
 	dlq.Start()
 
+	log.Printf("[batch-writer] running (instance=%s metrics-port=%d)",
+		cfg.Redis.ConsumerName, cfg.Metrics.Port)
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	log.Printf("[batch-writer] running (instance=%s port=%d)",
-		envOr("INSTANCE_ID", "batch-writer-0"), cfg.Metrics.Port)
-
 	<-sig
-	log.Println("[batch-writer] shutting down...")
+
+	log.Println("[batch-writer] shutting down — draining...")
+	cancel()
 	batch.Stop()
 	dlq.Stop()
 	log.Println("[batch-writer] done")
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-func envInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
-	}
-	return def
 }
