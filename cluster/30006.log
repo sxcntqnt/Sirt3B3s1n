@@ -1,0 +1,49 @@
+17038:C 06 May 2026 10:51:01.113 # WARNING: Changing databases number from 16 to 1 since we are in cluster mode
+17038:C 06 May 2026 10:51:01.113 # WARNING Memory overcommit must be enabled! Without it, a background save or replication may fail under low memory condition. Being disabled, it can also cause failures without low memory condition, see https://github.com/jemalloc/jemalloc/issues/1328. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.
+17044:C 06 May 2026 10:51:01.114 * oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo
+17044:C 06 May 2026 10:51:01.114 * Redis version=8.0.5, bits=64, commit=00000000, modified=0, pid=17044, just started
+17044:C 06 May 2026 10:51:01.114 * Configuration loaded
+17044:M 06 May 2026 10:51:01.115 * monotonic clock: POSIX clock_gettime
+17044:M 06 May 2026 10:51:01.115 * Running mode=cluster, port=30006.
+17044:M 06 May 2026 10:51:01.116 * No cluster configuration found, I'm 9820a653da2e9b27a04d0b811ae114d0930c54ac
+17044:M 06 May 2026 10:51:01.117 * Server initialized
+17044:M 06 May 2026 10:51:01.118 * Creating AOF base file appendonly-30006.aof.1.base.rdb on server start
+17044:M 06 May 2026 10:51:01.119 * Creating AOF incr file appendonly-30006.aof.1.incr.aof on server start
+17044:M 06 May 2026 10:51:01.119 * Ready to accept connections tcp
+17044:M 06 May 2026 10:51:07.259 * configEpoch set to 6 via CLUSTER SET-CONFIG-EPOCH
+17044:M 06 May 2026 10:51:07.433 * IP address for this node updated to 127.0.0.1
+17044:S 06 May 2026 10:51:09.265 * Before turning into a replica, using my own master parameters to synthesize a cached master: I may be able to synchronize with the new master with just a partial transfer.
+17044:S 06 May 2026 10:51:09.265 * Connecting to MASTER 127.0.0.1:30001
+17044:S 06 May 2026 10:51:09.265 * MASTER <-> REPLICA sync started
+17044:S 06 May 2026 10:51:09.265 * Cluster state changed: ok
+17044:S 06 May 2026 10:51:09.266 * Non blocking connect for SYNC fired the event.
+17044:S 06 May 2026 10:51:09.267 * Master replied to PING, replication can continue...
+17044:S 06 May 2026 10:51:09.267 * Trying a partial resynchronization (request 07b1db6c38c295bee3a0f1ce1225a447540d8a1e:1).
+17044:S 06 May 2026 10:51:09.268 * PSYNC is not possible, initialize RDB channel.
+17044:S 06 May 2026 10:51:10.060 * Node 9a745dc10c04bfef721072190e09177ac5d86a0d () is no longer master of shard 96cbee719eb7bbf048b224e1f728e20735bf2d83; removed all 0 slot(s) it used to own
+17044:S 06 May 2026 10:51:10.060 * Node 9a745dc10c04bfef721072190e09177ac5d86a0d () is now part of shard b61c310e2654ebe204a818d8c09ba35b0d431867
+17044:S 06 May 2026 10:51:10.064 * Node cdc883496113c210ad0885596fa2daee4dd1ed02 () is no longer master of shard 346d2c952bab60f1acf153411dc7ae0097c11f8d; removed all 0 slot(s) it used to own
+17044:S 06 May 2026 10:51:10.065 * Node cdc883496113c210ad0885596fa2daee4dd1ed02 () is now part of shard 6464e13e0e380ad3d62c97f7a1cf6599b50822ff
+17044:S 06 May 2026 10:51:14.179 * Starting to receive RDB and replication stream in parallel.
+17044:S 06 May 2026 10:51:14.179 * MASTER <-> REPLICA sync: receiving streamed RDB from master with EOF to disk
+17044:S 06 May 2026 10:51:14.188 * Discarding previously cached master state.
+17044:S 06 May 2026 10:51:14.188 * MASTER <-> REPLICA sync: Loading DB in memory
+17044:S 06 May 2026 10:51:14.189 * MASTER <-> REPLICA sync: Flushing old data
+17044:S 06 May 2026 10:51:14.197 * Loading RDB produced by version 8.0.5
+17044:S 06 May 2026 10:51:14.197 * RDB age 0 seconds
+17044:S 06 May 2026 10:51:14.198 * RDB memory usage when created 2.13 Mb
+17044:S 06 May 2026 10:51:14.198 * Done loading RDB, keys loaded: 0, keys expired: 0.
+17044:S 06 May 2026 10:51:14.198 * MASTER <-> REPLICA sync: Finished with success
+17044:S 06 May 2026 10:51:14.198 * MASTER <-> REPLICA sync: Starting AOF after a successful sync
+17044:S 06 May 2026 10:51:14.199 * Creating AOF incr file temp-appendonly-30006.aof.incr on background rewrite
+17044:S 06 May 2026 10:51:14.199 * Background append only file rewriting started by pid 17078
+17044:S 06 May 2026 10:51:14.200 * MASTER <-> REPLICA sync: Starting to stream replication buffer into the db (0 bytes).
+17044:S 06 May 2026 10:51:14.201 * MASTER <-> REPLICA sync: Successfully streamed replication buffer into the db (0 bytes in total)
+17078:C 06 May 2026 10:51:14.201 * Successfully created the temporary AOF base file temp-rewriteaof-bg-17078.aof
+17078:C 06 May 2026 10:51:14.202 * Fork CoW for AOF rewrite: current 0 MB, peak 0 MB, average 0 MB
+17044:S 06 May 2026 10:51:14.302 * Background AOF rewrite terminated with success
+17044:S 06 May 2026 10:51:14.302 * Successfully renamed the temporary AOF base file temp-rewriteaof-bg-17078.aof into appendonly-30006.aof.2.base.rdb
+17044:S 06 May 2026 10:51:14.303 * Successfully renamed the temporary AOF incr file temp-appendonly-30006.aof.incr into appendonly-30006.aof.2.incr.aof
+17044:S 06 May 2026 10:51:14.304 * Removing the history file appendonly-30006.aof.1.incr.aof in the background
+17044:S 06 May 2026 10:51:14.304 * Removing the history file appendonly-30006.aof.1.base.rdb in the background
+17044:S 06 May 2026 10:51:14.305 * Background AOF rewrite finished successfully

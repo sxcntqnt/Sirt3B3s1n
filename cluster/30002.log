@@ -1,0 +1,35 @@
+17010:C 06 May 2026 10:51:01.091 # WARNING: Changing databases number from 16 to 1 since we are in cluster mode
+17010:C 06 May 2026 10:51:01.091 # WARNING Memory overcommit must be enabled! Without it, a background save or replication may fail under low memory condition. Being disabled, it can also cause failures without low memory condition, see https://github.com/jemalloc/jemalloc/issues/1328. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.
+17016:C 06 May 2026 10:51:01.092 * oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo
+17016:C 06 May 2026 10:51:01.092 * Redis version=8.0.5, bits=64, commit=00000000, modified=0, pid=17016, just started
+17016:C 06 May 2026 10:51:01.093 * Configuration loaded
+17016:M 06 May 2026 10:51:01.093 * monotonic clock: POSIX clock_gettime
+17016:M 06 May 2026 10:51:01.094 * Running mode=cluster, port=30002.
+17016:M 06 May 2026 10:51:01.094 * No cluster configuration found, I'm 74f1a5661212f7e2ca7a30e19d0268ecc9369ebd
+17016:M 06 May 2026 10:51:01.096 * Server initialized
+17016:M 06 May 2026 10:51:01.097 * Creating AOF base file appendonly-30002.aof.1.base.rdb on server start
+17016:M 06 May 2026 10:51:01.098 * Creating AOF incr file appendonly-30002.aof.1.incr.aof on server start
+17016:M 06 May 2026 10:51:01.098 * Ready to accept connections tcp
+17016:M 06 May 2026 10:51:07.257 * configEpoch set to 2 via CLUSTER SET-CONFIG-EPOCH
+17016:M 06 May 2026 10:51:07.433 * IP address for this node updated to 127.0.0.1
+17016:M 06 May 2026 10:51:09.249 * Cluster state changed: ok
+17016:M 06 May 2026 10:51:09.264 * Replica 127.0.0.1:30004 asks for synchronization
+17016:M 06 May 2026 10:51:09.264 * Partial resynchronization not accepted: Replication ID mismatch (Replica asked for 'a81cbfa8e72486bbd1077099b9be6004d06e8361', my replication IDs are 'cff7db0bf58fa02d892c9392b78c1d79dbe45895' and '0000000000000000000000000000000000000000')
+17016:M 06 May 2026 10:51:09.264 * Replication backlog created, my new replication IDs are '4b7105c44435dd6825beabebf48f4d897b8e7840' and '0000000000000000000000000000000000000000'
+17016:M 06 May 2026 10:51:09.264 * Replica 127.0.0.1:30004 is capable of rdb channel synchronization, and partial sync isn't possible. Full sync will continue with dedicated rdb channel.
+17016:M 06 May 2026 10:51:09.265 * Replica 127.0.0.1:30004 asks for synchronization
+17016:M 06 May 2026 10:51:09.266 * Full resync requested by replica 127.0.0.1:30004 (rdb-channel)
+17016:M 06 May 2026 10:51:09.266 * Delay next BGSAVE for diskless SYNC
+17016:M 06 May 2026 10:51:10.054 * Node 9a745dc10c04bfef721072190e09177ac5d86a0d () is no longer master of shard 96cbee719eb7bbf048b224e1f728e20735bf2d83; removed all 0 slot(s) it used to own
+17016:M 06 May 2026 10:51:10.055 * Node 9a745dc10c04bfef721072190e09177ac5d86a0d () is now part of shard b61c310e2654ebe204a818d8c09ba35b0d431867
+17016:M 06 May 2026 10:51:10.064 * Node cdc883496113c210ad0885596fa2daee4dd1ed02 () is no longer master of shard 346d2c952bab60f1acf153411dc7ae0097c11f8d; removed all 0 slot(s) it used to own
+17016:M 06 May 2026 10:51:10.065 * Node cdc883496113c210ad0885596fa2daee4dd1ed02 () is now part of shard 6464e13e0e380ad3d62c97f7a1cf6599b50822ff
+17016:M 06 May 2026 10:51:10.072 * Node 9820a653da2e9b27a04d0b811ae114d0930c54ac () is no longer master of shard ece021d89650561040196b6bc31445bda198c09f; removed all 0 slot(s) it used to own
+17016:M 06 May 2026 10:51:10.072 * Node 9820a653da2e9b27a04d0b811ae114d0930c54ac () is now part of shard a7c8581184e8c881a8b15ccfe03edb26805d4358
+17016:M 06 May 2026 10:51:14.187 * Starting BGSAVE for SYNC with target: replicas sockets (rdb-channel)
+17016:M 06 May 2026 10:51:14.188 * Starting to deliver RDB and replication stream to replica: 127.0.0.1:30004
+17016:M 06 May 2026 10:51:14.188 * Background RDB transfer started by pid 17076 to replica socket
+17076:C 06 May 2026 10:51:14.195 * Fork CoW for RDB: current 0 MB, peak 0 MB, average 0 MB
+17016:M 06 May 2026 10:51:14.204 * Synchronization with replica 127.0.0.1:30004 succeeded
+17016:M 06 May 2026 10:51:14.205 * Connection with replica (rdbchannel) 127.0.0.1:30004 lost.
+17016:M 06 May 2026 10:51:14.290 * Background RDB transfer terminated with success

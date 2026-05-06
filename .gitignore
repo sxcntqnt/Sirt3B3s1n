@@ -1,3 +1,4 @@
 bin/
 .env
 B3S1N/
+cluster/data
