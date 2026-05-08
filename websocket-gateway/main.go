@@ -1,10 +1,20 @@
 // websocket-gateway/main.go
-// All types, clients, and helpers live in internal.go (same package).
-// Fixes applied (scalability audit):
-//  1. `for _, vehicleId := range msg.VehicleIDs` — was missing `range`.
-//  2. sendInitialPositions uses parameterised query (? binding); was fmt.Sprintf → SQL injection.
-//  3. removeConnection() and isConnectionAlive() now defined.
-//  4. Metrics port from METRICS_PORT env.
+//
+// Config precedence: ENV > websocket-gateway.yaml > coded defaults.
+// All env keys are prefixed WEBSOCKET_GATEWAY_ by Viper.
+//
+// P0 production fixes applied:
+//   - WS_PORT env var: each replica binds a different port (no more 8080 collision).
+//   - CLICKHOUSE_HOST validated at startup: fatal if empty.
+//   - INSTANCE_ID used as Redis consumer name: correct multi-replica fanout.
+//   - Strict CheckOrigin via configured AllowedOrigins list.
+//   - Per-connection write goroutine: eliminates concurrent WriteJSON race.
+//   - StreamDispatcher: one Redis reader per org (not per connection).
+//   - VehicleIndex: O(1) fanout (not O(connections) scan).
+//   - Write deadlines: slow clients dropped after maxConsecutiveDrops.
+//   - Subscription limit enforced in handleSubscription.
+//   - Pong handler + read deadline: stale connections detected and removed.
+//   - startHeartbeat: goroutine exits on conn.closed (no leak).
 package main
 
 import (
@@ -15,18 +25,21 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/redis/go-redis/v9"
+	redis "github.com/redis/go-redis/v9"
+	"github.com/spf13/viper"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Config types
+// Config — Viper-backed, atomic ConfigHolder, 12-factor layering
 // ─────────────────────────────────────────────────────────────────────────────
 
 type Config struct {
@@ -35,19 +48,20 @@ type Config struct {
 	ClickHouse    ClickHouseConfig
 	Auth          AuthConfig
 	Subscriptions SubscriptionConfig
-	Messaging     MessagingConfig
 	Metrics       MetricsConfig
 	RateLimiting  RateLimitingConfig
 }
 
 type ServerConfig struct {
-	Port              int
-	Host              string
-	MaxConnections    int
-	MaxPayloadSize    int
-	PingInterval      time.Duration
-	PingTimeout       time.Duration
-	BackpressureLimit int
+	Port           int
+	Host           string
+	MaxConnections int
+	MaxPayloadSize int
+	PingInterval   time.Duration
+	PingTimeout    time.Duration
+	WriteTimeout   time.Duration
+	WriteBufSize   int      // per-connection writeChan capacity
+	AllowedOrigins []string // strict origin allowlist; "*" = allow all (dev only)
 }
 
 type RedisConfig struct {
@@ -58,9 +72,8 @@ type RedisConfig struct {
 }
 
 type RedisStreamConfig struct {
-	Realtime      string
 	ConsumerGroup string
-	ConsumerName  string
+	ConsumerName  string // set to INSTANCE_ID at runtime
 }
 
 type ClickHouseConfig struct {
@@ -79,37 +92,11 @@ type ConnectionPool struct {
 }
 
 type AuthConfig struct {
-	ServiceURL       string
-	JWTSecret        string
-	TokenExpiry      time.Duration
-	RefreshThreshold time.Duration
+	JWTSecret string
 }
 
 type SubscriptionConfig struct {
-	MaxPerConnection  int
-	MaxVehiclesPerOrg int
-	HeartbeatInterval time.Duration
-	ReconnectTimeout  time.Duration
-	Backoff           BackoffConfig
-}
-
-type BackoffConfig struct {
-	Initial time.Duration
-	Max     time.Duration
-	Factor  float64
-}
-
-type MessagingConfig struct {
-	BatchSize     int
-	FlushInterval time.Duration
-	MaxQueueSize  int
-	Priority      PriorityConfig
-}
-
-type PriorityConfig struct {
-	Critical []string
-	High     []string
-	Normal   []string
+	MaxPerConnection int
 }
 
 type MetricsConfig struct {
@@ -119,64 +106,152 @@ type MetricsConfig struct {
 }
 
 type RateLimitingConfig struct {
-	Enabled              bool
-	MaxConnectionsPerIP  int
-	MaxMessagesPerSecond int
-	BurstSize            int
-	WindowMs             time.Duration
+	Enabled             bool
+	MaxConnectionsPerIP int64 // connection-level (handled by token bucket)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Config loader
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── ConfigHolder — immutable snapshot + atomic swap ────────────────────────
 
-func loadConfig() Config {
-	instanceID  := envOr("INSTANCE_ID", "websocket-gateway-0")
-	metricsPort := envInt("METRICS_PORT", 9090) // FIX: from env
+type ConfigHolder struct {
+	val atomic.Value // stores *Config
+}
 
-	return Config{
+func NewConfigHolder(cfg *Config) *ConfigHolder {
+	h := &ConfigHolder{}
+	h.val.Store(cfg)
+	return h
+}
+
+func (h *ConfigHolder) Get() *Config    { return h.val.Load().(*Config) }
+func (h *ConfigHolder) Set(cfg *Config) { h.val.Store(cfg) }
+
+// ─── Viper loader ────────────────────────────────────────────────────────────
+
+func loadConfig() (*Config, error) {
+	v := viper.New()
+
+	v.AutomaticEnv()
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.SetEnvPrefix("WEBSOCKET_GATEWAY")
+
+	v.SetConfigName("websocket-gateway")
+	v.SetConfigType("yaml")
+	v.AddConfigPath(".")
+	v.AddConfigPath("/etc/matatu-pulse")
+	_ = v.ReadInConfig()
+
+	instanceID := envOr("INSTANCE_ID", "websocket-gateway-0")
+
+	// ── defaults ─────────────────────────────────────────────────────────────
+	// P0 FIX: port from WS_PORT env so each replica binds a different port.
+	// Orchestrator sets WS_PORT=8080+replica, e.g. 8080, 8081, 8082.
+	serverPort := 8080
+	if p := os.Getenv("WS_PORT"); p != "" {
+		if n, err := strconv.Atoi(p); err == nil && n > 0 {
+			serverPort = n
+		}
+	}
+
+	metricsPort := 9090
+	if p := os.Getenv("METRICS_PORT"); p != "" {
+		if n, err := strconv.Atoi(p); err == nil && n > 0 {
+			metricsPort = n
+		}
+	}
+
+	v.SetDefault("server.host", "0.0.0.0")
+	v.SetDefault("server.max_connections", 10000)
+	v.SetDefault("server.max_payload_size", 65536)
+	v.SetDefault("server.ping_interval", "30s")
+	v.SetDefault("server.ping_timeout", "10s")
+	v.SetDefault("server.write_timeout", "5s")
+	v.SetDefault("server.write_buf_size", 256)
+	v.SetDefault("server.allowed_origins", []string{}) // empty = deny all (safe default)
+
+	v.SetDefault("redis.cluster", true)
+	v.SetDefault("redis.nodes", []string{"redis-01:6379", "redis-02:6379", "redis-03:6379"})
+	v.SetDefault("redis.streams.consumer_group", "ws-gateway")
+
+	v.SetDefault("clickhouse.database", "default")
+	v.SetDefault("clickhouse.query_timeout", "5s")
+	v.SetDefault("clickhouse.connection_pool.max_size", 10)
+	v.SetDefault("clickhouse.connection_pool.min_idle", 2)
+	v.SetDefault("clickhouse.connection_pool.max_lifetime", "5m")
+
+	v.SetDefault("subscriptions.max_per_connection", 1000)
+
+	v.SetDefault("metrics.path", "/metrics")
+	v.SetDefault("metrics.buckets",
+		[]float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5})
+
+	v.SetDefault("rate_limiting.enabled", true)
+	v.SetDefault("rate_limiting.max_connections_per_ip", int64(100))
+
+	cfg := &Config{
 		Server: ServerConfig{
-			Port: 8080, Host: "0.0.0.0",
-			MaxConnections: 10000, MaxPayloadSize: 65536,
-			PingInterval: 30 * time.Second, PingTimeout: 10 * time.Second,
-			BackpressureLimit: 262144,
+			Port:           serverPort, // P0 FIX
+			Host:           v.GetString("server.host"),
+			MaxConnections: v.GetInt("server.max_connections"),
+			MaxPayloadSize: v.GetInt("server.max_payload_size"),
+			PingInterval:   v.GetDuration("server.ping_interval"),
+			PingTimeout:    v.GetDuration("server.ping_timeout"),
+			WriteTimeout:   v.GetDuration("server.write_timeout"),
+			WriteBufSize:   v.GetInt("server.write_buf_size"),
+			AllowedOrigins: v.GetStringSlice("server.allowed_origins"),
 		},
 		Redis: RedisConfig{
-			Cluster:  true,
-			Nodes:    []string{"redis-01:6379", "redis-02:6379", "redis-03:6379"},
-			Password: os.Getenv("REDIS_PASSWORD"),
+			Cluster:  v.GetBool("redis.cluster"),
+			Nodes:    v.GetStringSlice("redis.nodes"),
+			Password: v.GetString("redis.password"),
 			Streams: RedisStreamConfig{
-				Realtime:      "gps:realtime:{orgId}",
-				ConsumerGroup: "ws-gateway",
-				ConsumerName:  instanceID,
+				ConsumerGroup: v.GetString("redis.streams.consumer_group"),
+				ConsumerName:  instanceID, // P0 FIX: unique per instance
 			},
 		},
 		ClickHouse: ClickHouseConfig{
-			Host: os.Getenv("CLICKHOUSE_HOST"), Username: os.Getenv("CLICKHOUSE_USERNAME"),
-			Password: os.Getenv("CLICKHOUSE_PASSWORD"), Database: "default",
-			QueryTimeout: 5 * time.Second,
-			ConnectionPool: ConnectionPool{MaxSize: 10, MinIdle: 2, MaxLifetime: 5 * time.Minute},
-		},
-		Auth: AuthConfig{
-			ServiceURL: os.Getenv("AUTH_SERVICE_URL"), JWTSecret: os.Getenv("JWT_SECRET"),
-			TokenExpiry: 15 * time.Minute, RefreshThreshold: 5 * time.Minute,
-		},
-		Subscriptions: SubscriptionConfig{
-			MaxPerConnection: 1000, MaxVehiclesPerOrg: 10000,
-			HeartbeatInterval: 30 * time.Second, ReconnectTimeout: 10 * time.Second,
-			Backoff: BackoffConfig{Initial: time.Second, Max: 10 * time.Second, Factor: 2},
-		},
-		Messaging: MessagingConfig{
-			BatchSize: 50, FlushInterval: 100 * time.Millisecond, MaxQueueSize: 10000,
-			Priority: PriorityConfig{
-				Critical: []string{"PANIC_BUTTON", "OVERSPEED", "GPS_SIGNAL_LOST"},
-				High:     []string{"GEOFENCE_ENTER", "GEOFENCE_EXIT", "HARSH_BRAKING", "HARSH_ACCELERATION"},
-				Normal:   []string{"NORMAL", "IGNITION_ON", "IGNITION_OFF"},
+			Host:         v.GetString("clickhouse.host"),
+			Username:     v.GetString("clickhouse.username"),
+			Password:     v.GetString("clickhouse.password"),
+			Database:     v.GetString("clickhouse.database"),
+			QueryTimeout: v.GetDuration("clickhouse.query_timeout"),
+			ConnectionPool: ConnectionPool{
+				MaxSize:     v.GetInt("clickhouse.connection_pool.max_size"),
+				MinIdle:     v.GetInt("clickhouse.connection_pool.min_idle"),
+				MaxLifetime: v.GetDuration("clickhouse.connection_pool.max_lifetime"),
 			},
 		},
-		Metrics:      MetricsConfig{Port: metricsPort, Path: "/metrics", Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5}},
-		RateLimiting: RateLimitingConfig{Enabled: true, MaxConnectionsPerIP: 100, MaxMessagesPerSecond: 1000, BurstSize: 100, WindowMs: time.Second},
+		Auth: AuthConfig{
+			JWTSecret: v.GetString("auth.jwt_secret"),
+		},
+		Subscriptions: SubscriptionConfig{
+			MaxPerConnection: v.GetInt("subscriptions.max_per_connection"),
+		},
+		Metrics: MetricsConfig{
+			Port:    metricsPort,
+			Path:    v.GetString("metrics.path"),
+			Buckets: getFloat64Slice(v, "metrics.buckets"),
+		},
+		RateLimiting: RateLimitingConfig{
+			Enabled:             v.GetBool("rate_limiting.enabled"),
+			MaxConnectionsPerIP: v.GetInt64("rate_limiting.max_connections_per_ip"),
+		},
 	}
+
+	// ── validation ───────────────────────────────────────────────────────────
+	// P0 FIX: validate ClickHouse host at startup — fail fast, not at first query.
+	if cfg.ClickHouse.Host == "" {
+		return nil, fmt.Errorf(
+			"WEBSOCKET_GATEWAY_CLICKHOUSE_HOST (or clickhouse.host) is required; " +
+				"set it to the ClickHouse host (e.g. 127.0.0.1, NOT 127.0.0.1:9000)")
+	}
+	if cfg.Auth.JWTSecret == "" {
+		return nil, fmt.Errorf("WEBSOCKET_GATEWAY_AUTH_JWT_SECRET is required")
+	}
+	if len(cfg.Redis.Nodes) == 0 {
+		return nil, fmt.Errorf("redis.nodes must not be empty")
+	}
+
+	return cfg, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -186,147 +261,281 @@ func loadConfig() Config {
 type WebSocketMetrics struct {
 	connectionsActive    prometheus.Gauge
 	messagesPushed       prometheus.Counter
-	clientBufferPressure prometheus.Gauge
+	messagesDropped      prometheus.Counter   // slow-client drops
+	clientBufferPressure prometheus.Gauge     // fraction of full write channels
 	redisReadLag         prometheus.Gauge
 	connectionErrors     prometheus.Counter
 	authErrors           prometheus.Counter
 	messageLatency       prometheus.Histogram
+	subscriptionsActive  *prometheus.GaugeVec // per org
 }
 
 func NewWebSocketMetrics(buckets []float64) *WebSocketMetrics {
 	m := &WebSocketMetrics{
-		connectionsActive:    prometheus.NewGauge(prometheus.GaugeOpts{Name: "websocket_gateway_connections_active"}),
-		messagesPushed:       prometheus.NewCounter(prometheus.CounterOpts{Name: "websocket_gateway_messages_pushed_total"}),
-		clientBufferPressure: prometheus.NewGauge(prometheus.GaugeOpts{Name: "ws_client_buffer_pressure"}),
-		redisReadLag:         prometheus.NewGauge(prometheus.GaugeOpts{Name: "websocket_gateway_redis_read_lag"}),
-		connectionErrors:     prometheus.NewCounter(prometheus.CounterOpts{Name: "websocket_gateway_connection_errors_total"}),
-		authErrors:           prometheus.NewCounter(prometheus.CounterOpts{Name: "websocket_gateway_auth_errors_total"}),
+		connectionsActive: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "websocket_gateway_connections_active",
+			Help: "Number of active WebSocket connections",
+		}),
+		messagesPushed: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "websocket_gateway_messages_pushed_total",
+			Help: "Total messages delivered to WebSocket clients",
+		}),
+		messagesDropped: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "websocket_gateway_messages_dropped_total",
+			Help: "Messages dropped due to slow clients",
+		}),
+		clientBufferPressure: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "websocket_gateway_client_buffer_pressure",
+			Help: "Fraction of connections with full write buffers [0,1]",
+		}),
+		redisReadLag: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "websocket_gateway_redis_read_lag",
+			Help: "Approximate Redis stream lag observed by the dispatcher",
+		}),
+		connectionErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "websocket_gateway_connection_errors_total",
+			Help: "WebSocket upgrade errors",
+		}),
+		authErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "websocket_gateway_auth_errors_total",
+			Help: "JWT authentication failures",
+		}),
 		messageLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Name: "websocket_gateway_message_latency_ms", Buckets: buckets}),
+			Name:    "websocket_gateway_message_latency_ms",
+			Help:    "Latency from stream read to client dispatch in milliseconds",
+			Buckets: buckets,
+		}),
+		subscriptionsActive: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "websocket_gateway_subscriptions_active",
+			Help: "Active vehicle subscriptions per org",
+		}, []string{"org_id"}),
 	}
-	prometheus.MustRegister(m.connectionsActive, m.messagesPushed, m.clientBufferPressure,
-		m.redisReadLag, m.connectionErrors, m.authErrors, m.messageLatency)
+	prometheus.MustRegister(
+		m.connectionsActive, m.messagesPushed, m.messagesDropped,
+		m.clientBufferPressure, m.redisReadLag,
+		m.connectionErrors, m.authErrors, m.messageLatency,
+		m.subscriptionsActive,
+	)
 	return m
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WebSocket connection
-// ─────────────────────────────────────────────────────────────────────────────
-
-type WebSocketConnection struct {
-	ID            string
-	Conn          *websocket.Conn
-	OrgID         string
-	UserID        string
-	Subscriptions map[string]bool
-	mu            sync.RWMutex
-	closed        bool
-}
-
-func (c *WebSocketConnection) IsClosed() bool {
-	c.mu.RLock(); defer c.mu.RUnlock(); return c.closed
-}
-
-func (c *WebSocketConnection) Close() {
-	c.mu.Lock(); defer c.mu.Unlock()
-	if !c.closed { c.closed = true; _ = c.Conn.Close() }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Backend
+// WebSocketBackend
 // ─────────────────────────────────────────────────────────────────────────────
 
 type WebSocketBackend struct {
-	config      Config
-	redisClient *redis.ClusterClient
-	chClient    *CHClient // defined in internal.go
-	metrics     *WebSocketMetrics
+	cfgHolder    *ConfigHolder
+	redisClient  *redis.ClusterClient
+	chClient     *CHClient
+	metrics      *WebSocketMetrics
+	vehicleIndex *VehicleIndex
+	dispatcher   *StreamDispatcher
+
+	dispatchCtx    context.Context
+	dispatchCancel context.CancelFunc
+
 	connMu      sync.RWMutex
 	connections map[string]*WebSocketConnection
 }
 
-func NewWebSocketBackend(cfg Config, rdb *redis.ClusterClient, ch *CHClient, m *WebSocketMetrics) *WebSocketBackend {
+func NewWebSocketBackend(
+	cfgHolder *ConfigHolder,
+	rdb *redis.ClusterClient,
+	ch *CHClient,
+	metrics *WebSocketMetrics,
+) *WebSocketBackend {
+	cfg := cfgHolder.Get()
+	ctx, cancel := context.WithCancel(context.Background())
+	index := NewVehicleIndex()
+	dispatcher := NewStreamDispatcher(
+		rdb,
+		cfg.Redis.Streams.ConsumerGroup,
+		cfg.Redis.Streams.ConsumerName,
+		index,
+		metrics,
+	)
 	return &WebSocketBackend{
-		config: cfg, redisClient: rdb, chClient: ch, metrics: m,
-		connections: make(map[string]*WebSocketConnection),
+		cfgHolder:      cfgHolder,
+		redisClient:    rdb,
+		chClient:       ch,
+		metrics:        metrics,
+		vehicleIndex:   index,
+		dispatcher:     dispatcher,
+		dispatchCtx:    ctx,
+		dispatchCancel: cancel,
+		connections:    make(map[string]*WebSocketConnection),
 	}
 }
 
 func (b *WebSocketBackend) Shutdown() {
-	b.connMu.RLock(); defer b.connMu.RUnlock()
-	for _, c := range b.connections { c.Close() }
+	b.dispatchCancel() // stops all StreamDispatcher org goroutines
+
+	b.connMu.RLock()
+	for _, c := range b.connections {
+		c.Close()
+	}
+	b.connMu.RUnlock()
 }
 
-// removeConnection closes and removes a connection.
-// FIX: was called by handleIncomingMessages but never defined → compile error.
+// HandleConnection is called once per accepted WebSocket upgrade.
+//
+// It sets up:
+//   - The write goroutine (writeLoop) — sole owner of conn.Conn.Write*
+//   - Pong handler + read deadline for liveness detection
+//   - StreamDispatcher registration so the org stream is read
+//   - Initial position snapshot (async, via conn.Send)
+//   - Heartbeat goroutine
+//   - Message read loop (blocking, current goroutine)
+func (b *WebSocketBackend) HandleConnection(conn *websocket.Conn, orgID, userID string) {
+	cfg := b.cfgHolder.Get()
+
+	ws := newWebSocketConnection(conn, orgID, userID, cfg.Server.WriteBufSize)
+
+	// Register connection.
+	b.connMu.Lock()
+	b.connections[ws.ID] = ws
+	b.connMu.Unlock()
+	b.metrics.connectionsActive.Inc()
+
+	// Configure liveness: gorilla requires pong handler and read deadline
+	// to be set before the first read. Read deadline is reset on every pong.
+	pongWait := cfg.Server.PingInterval + cfg.Server.PingTimeout
+	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(_ string) error {
+		ws.lastPongAt.Store(time.Now().UnixNano())
+		return conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
+
+	// Start the single write goroutine.
+	go ws.writeLoop(cfg.Server.WriteTimeout)
+
+	// Ensure the org's Redis stream reader is running.
+	b.dispatcher.EnsureOrg(b.dispatchCtx, orgID)
+
+	// Async: send last-known positions from ClickHouse.
+	go b.sendInitialPositions(ws)
+
+	// Async: ping at interval, rely on read deadline for pong enforcement.
+	go b.startHeartbeat(ws)
+
+	// Blocking: read loop.
+	b.handleIncomingMessages(ws)
+}
+
+// removeConnection closes the connection and cleans up all index state.
 func (b *WebSocketBackend) removeConnection(id string) {
 	b.connMu.Lock()
 	conn, ok := b.connections[id]
-	if ok { delete(b.connections, id) }
-	b.connMu.Unlock()
 	if ok {
-		conn.Close()
-		b.metrics.connectionsActive.Dec()
-		log.Printf("[websocket-gateway] removed %s", id)
+		delete(b.connections, id)
 	}
-}
+	b.connMu.Unlock()
 
-// isConnectionAlive pings the client and returns true if it responds.
-// FIX: was called by startStreamReader but never defined → compile error.
-func (b *WebSocketBackend) isConnectionAlive(conn *WebSocketConnection) bool {
-	if conn.IsClosed() { return false }
-	conn.mu.Lock(); defer conn.mu.Unlock()
-	return conn.Conn.WriteControl(websocket.PingMessage, []byte("ping"),
-		time.Now().Add(b.config.Server.PingTimeout)) == nil
-}
-
-func (b *WebSocketBackend) HandleConnection(conn *websocket.Conn, orgID, userID string) {
-	id := generateUUID() // defined in internal.go
-	ws := &WebSocketConnection{ID: id, Conn: conn, OrgID: orgID, UserID: userID, Subscriptions: make(map[string]bool)}
-	b.connMu.Lock(); b.connections[id] = ws; b.connMu.Unlock()
-	b.metrics.connectionsActive.Inc()
-	go b.startStreamReader(ws)
-	go b.handleIncomingMessages(ws)
-	go b.sendInitialPositions(ws)
-	go b.startHeartbeat(ws)
-}
-
-func (b *WebSocketBackend) startStreamReader(conn *WebSocketConnection) {
-	streamKey := "gps:realtime:" + conn.OrgID
-	args := redis.XReadGroupArgs{
-		Group: b.config.Redis.Streams.ConsumerGroup, Consumer: b.config.Redis.Streams.ConsumerName,
-		Streams: []string{streamKey, ">"}, Count: 100, Block: 100 * time.Millisecond,
+	if !ok {
+		return
 	}
+
+	b.vehicleIndex.RemoveAll(conn)
+	conn.Close()
+	b.metrics.connectionsActive.Dec()
+	b.metrics.subscriptionsActive.
+		WithLabelValues(conn.OrgID).
+		Sub(float64(conn.subscriptionCount.Load()))
+
+	log.Printf("[websocket-gateway] disconnected %s org=%s subs=%d",
+		conn.ID, conn.OrgID, conn.subscriptionCount.Load())
+}
+
+// handleIncomingMessages is the sole reader goroutine for a connection.
+// It blocks until the connection closes, then calls removeConnection.
+func (b *WebSocketBackend) handleIncomingMessages(conn *WebSocketConnection) {
+	defer b.removeConnection(conn.ID)
+
 	for {
-		if !b.isConnectionAlive(conn) { break } // FIX: now defined
-		result, err := b.redisClient.XReadGroup(context.Background(), &args).Result()
-		if err != nil { if err != redis.Nil { time.Sleep(time.Second) }; continue }
-
-		for _, sr := range result {
-			for _, msg := range sr.Messages {
-				start := time.Now()
-				update := parsePositionUpdate(msg.Values) // defined in internal.go
-				conn.mu.RLock()
-				subscribed := conn.Subscriptions[update.VehicleID] || conn.Subscriptions["all"]
-				conn.mu.RUnlock()
-				if subscribed {
-					b.sendPositionUpdate(conn, update)
-					b.metrics.messagesPushed.Inc()
-					b.metrics.messageLatency.Observe(float64(time.Since(start).Milliseconds()))
-				}
-				_ = b.redisClient.XAck(context.Background(), streamKey,
-					b.config.Redis.Streams.ConsumerGroup, msg.ID)
+		var msg WebSocketMessage
+		if err := conn.Conn.ReadJSON(&msg); err != nil {
+			if !websocket.IsCloseError(err,
+				websocket.CloseGoingAway,
+				websocket.CloseNormalClosure,
+			) {
+				log.Printf("[websocket-gateway] read %s: %v", conn.ID, err)
 			}
+			return
+		}
+
+		switch msg.Type {
+		case "subscribe":
+			b.handleSubscription(conn, msg)
+		case "unsubscribe":
+			b.handleUnsubscription(conn, msg)
+		case "ping":
+			// Application-level ping (distinct from WebSocket control frame ping).
+			conn.Send(WebSocketMessage{
+				Type:      "pong",
+				Timestamp: time.Now().UnixMilli(),
+			})
 		}
 	}
 }
 
-// sendInitialPositions queries the last known position for all org vehicles.
-// FIX: was fmt.Sprintf(query, conn.OrgID) → SQL injection.
-// Now uses parameterised ? binding via CHClient.Query.
+// handleSubscription updates the VehicleIndex and enforces subscription limits.
+func (b *WebSocketBackend) handleSubscription(conn *WebSocketConnection, msg WebSocketMessage) {
+	cfg := b.cfgHolder.Get()
+
+	if msg.All {
+		b.vehicleIndex.SubscribeAll(conn)
+		conn.Send(WebSocketMessage{
+			Type:               "subscription_confirmation",
+			SubscribedVehicles: int(conn.subscriptionCount.Load()),
+		})
+		return
+	}
+
+	// Enforce per-connection subscription limit.
+	current := conn.subscriptionCount.Load()
+	headroom := int64(cfg.Subscriptions.MaxPerConnection) - current
+	if headroom <= 0 {
+		conn.Send(WebSocketMessage{
+			Type:  "error",
+			Error: fmt.Sprintf("subscription limit reached (%d)", cfg.Subscriptions.MaxPerConnection),
+		})
+		return
+	}
+
+	// Trim to available headroom.
+	toAdd := msg.VehicleIDs
+	if int64(len(toAdd)) > headroom {
+		toAdd = toAdd[:headroom]
+	}
+
+	newCount := b.vehicleIndex.Subscribe(conn, toAdd)
+	b.metrics.subscriptionsActive.WithLabelValues(conn.OrgID).Add(float64(len(toAdd)))
+
+	conn.Send(WebSocketMessage{
+		Type:               "subscription_confirmation",
+		SubscribedVehicles: int(newCount),
+	})
+}
+
+func (b *WebSocketBackend) handleUnsubscription(conn *WebSocketConnection, msg WebSocketMessage) {
+	b.vehicleIndex.Unsubscribe(conn, msg.VehicleIDs)
+	b.metrics.subscriptionsActive.
+		WithLabelValues(conn.OrgID).
+		Sub(float64(len(msg.VehicleIDs)))
+}
+
+// sendInitialPositions fetches the last-known position for all org vehicles
+// from ClickHouse and sends it via the connection's write channel.
+//
+// FIX: old version held conn.mu.Lock() and called WriteJSON directly — racing
+// with writeLoop. Now uses conn.Send() which is the only safe write path.
 func (b *WebSocketBackend) sendInitialPositions(conn *WebSocketConnection) {
-	if b.chClient == nil { return }
-	ctx, cancel := context.WithTimeout(context.Background(), b.config.ClickHouse.QueryTimeout)
+	if b.chClient == nil || conn.IsClosed() {
+		return
+	}
+
+	cfg := b.cfgHolder.Get()
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.ClickHouse.QueryTimeout)
 	defer cancel()
 
 	const query = `
@@ -341,115 +550,153 @@ func (b *WebSocketBackend) sendInitialPositions(conn *WebSocketConnection) {
 		  AND recorded_at >= now() - INTERVAL 5 MINUTE
 		GROUP BY vehicle_id`
 
-	rows, err := b.chClient.Query(ctx, query, conn.OrgID) // FIX: parameterised
-	if err != nil { log.Printf("[websocket-gateway] initial positions: %v", err); return }
+	rows, err := b.chClient.Query(ctx, query, conn.OrgID)
+	if err != nil {
+		log.Printf("[websocket-gateway] initial positions org=%s: %v", conn.OrgID, err)
+		return
+	}
 	defer rows.Close()
 
-	var positions []VehiclePosition // defined in internal.go
+	var positions []VehiclePosition
 	for rows.Next() {
 		var p VehiclePosition
-		if err := rows.ScanStruct(&p); err == nil { positions = append(positions, p) }
-	}
-	if conn.IsClosed() { return }
-	conn.mu.Lock(); defer conn.mu.Unlock()
-	_ = conn.Conn.WriteJSON(WebSocketMessage{Type: "initial_positions", Positions: positions})
-}
-
-func (b *WebSocketBackend) handleIncomingMessages(conn *WebSocketConnection) {
-	for {
-		var msg WebSocketMessage // defined in internal.go
-		if err := conn.Conn.ReadJSON(&msg); err != nil {
-			if !websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-				log.Printf("[websocket-gateway] read %s: %v", conn.ID, err)
-			}
-			b.removeConnection(conn.ID) // FIX: now defined
-			return
-		}
-		switch msg.Type {
-		case "subscribe":   b.handleSubscription(conn, msg)
-		case "unsubscribe": b.handleUnsubscription(conn, msg)
-		case "ping":
-			conn.mu.Lock()
-			_ = conn.Conn.WriteJSON(WebSocketMessage{Type: "pong", Timestamp: time.Now().UnixMilli()})
-			conn.mu.Unlock()
+		if err := rows.ScanStruct(&p); err == nil {
+			positions = append(positions, p)
 		}
 	}
-}
 
-func (b *WebSocketBackend) handleSubscription(conn *WebSocketConnection, msg WebSocketMessage) {
-	conn.mu.Lock(); defer conn.mu.Unlock()
-	if msg.All {
-		conn.Subscriptions["all"] = true
-	} else {
-		// FIX: was `for _, vehicleId := msg.VehicleIDs` — missing `range` keyword → syntax error.
-		for _, vehicleID := range msg.VehicleIDs {
-			conn.Subscriptions[vehicleID] = true
-		}
-	}
-	_ = conn.Conn.WriteJSON(WebSocketMessage{Type: "subscription_confirmation", SubscribedVehicles: len(conn.Subscriptions)})
-}
-
-func (b *WebSocketBackend) handleUnsubscription(conn *WebSocketConnection, msg WebSocketMessage) {
-	conn.mu.Lock(); defer conn.mu.Unlock()
-	for _, id := range msg.VehicleIDs { delete(conn.Subscriptions, id) }
-}
-
-func (b *WebSocketBackend) sendPositionUpdate(conn *WebSocketConnection, u PositionUpdate) {
-	if conn.IsClosed() { return }
-	conn.mu.Lock(); defer conn.mu.Unlock()
-	_ = conn.Conn.WriteJSON(WebSocketMessage{
-		Type: "position", VehicleID: u.VehicleID,
-		Latitude: u.Latitude, Longitude: u.Longitude,
-		Speed: u.Speed, Heading: u.Heading, Timestamp: u.Timestamp,
+	conn.Send(WebSocketMessage{
+		Type:      "initial_positions",
+		Positions: positions,
 	})
 }
 
+// startHeartbeat sends a WebSocket ping at PingInterval.
+//
+// FIX: old version looped on ticker.C with no exit condition — goroutine leak
+// after the connection closed. New version selects on conn.closed.
+//
+// FIX: old version called WriteControl directly from this goroutine — racing
+// with writeLoop. New version uses conn.SendPing() which enqueues via pingChan.
+//
+// Liveness enforcement is handled by the pong handler + read deadline:
+// if no pong arrives within PingInterval+PingTimeout, ReadJSON returns a
+// deadline error in handleIncomingMessages, which calls removeConnection.
 func (b *WebSocketBackend) startHeartbeat(conn *WebSocketConnection) {
-	ticker := time.NewTicker(b.config.Server.PingInterval); defer ticker.Stop()
-	for range ticker.C {
-		if !b.isConnectionAlive(conn) { b.removeConnection(conn.ID); return }
+	cfg := b.cfgHolder.Get()
+	ticker := time.NewTicker(cfg.Server.PingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-conn.closed: // FIX: exits cleanly on disconnect
+			return
+		case <-ticker.C:
+			if !conn.SendPing() {
+				return
+			}
+		}
 	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HTTP servers — FIX: metrics port from env
+// HTTP servers
 // ─────────────────────────────────────────────────────────────────────────────
 
 func startMetricsServer(cfg MetricsConfig) {
 	mux := http.NewServeMux()
 	mux.Handle(cfg.Path, promhttp.Handler())
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK); _, _ = w.Write([]byte("ok"))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
 	})
 	addr := fmt.Sprintf(":%d", cfg.Port)
 	log.Printf("[websocket-gateway] metrics+health on %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Printf("[websocket-gateway] metrics: %v", err)
+		log.Printf("[websocket-gateway] metrics server: %v", err)
 	}
 }
 
-func startHTTPServer(cfg ServerConfig, authCfg AuthConfig, rateCfg RateLimitingConfig, backend *WebSocketBackend) {
-	upgrader := websocket.Upgrader{
-		ReadBufferSize: cfg.MaxPayloadSize, WriteBufferSize: cfg.MaxPayloadSize,
-		CheckOrigin: func(_ *http.Request) bool { return true },
+func startHTTPServer(
+	cfg ServerConfig,
+	authCfg AuthConfig,
+	rateCfg RateLimitingConfig,
+	backend *WebSocketBackend,
+	rdb *redis.ClusterClient,
+) {
+	// P0 FIX: strict CheckOrigin.
+	// Build an O(1) lookup map from the allowed origins list.
+	// Empty list = deny all (safe default — requires explicit configuration).
+	// Single entry "*" = allow all (development only, never production).
+	allowedOrigins := make(map[string]bool, len(cfg.AllowedOrigins))
+	for _, o := range cfg.AllowedOrigins {
+		allowedOrigins[o] = true
 	}
+
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  cfg.MaxPayloadSize,
+		WriteBufferSize: cfg.MaxPayloadSize,
+		CheckOrigin: func(r *http.Request) bool {
+			if allowedOrigins["*"] {
+				return true // dev mode only
+			}
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				return false // non-browser client without origin — deny
+			}
+			return allowedOrigins[origin]
+		},
+	}
+
 	mux := http.NewServeMux()
+
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		// authenticateJWT and checkRateLimit defined in internal.go
-		orgID, userID, err := authenticateJWT(r.Header.Get("Authorization"), authCfg)
-		if err != nil { backend.metrics.authErrors.Inc(); http.Error(w, "unauthorized", 401); return }
-		if rateCfg.Enabled && !checkRateLimit(r.RemoteAddr, orgID) { http.Error(w, "rate limit", 429); return }
+		// Rate limit before upgrading (cheap check on raw TCP connection).
+		if rateCfg.Enabled {
+			if !checkRateLimit(r.RemoteAddr, rateCfg.MaxConnectionsPerIP) {
+				httpError(w, "rate limit exceeded", http.StatusTooManyRequests)
+				return
+			}
+		}
+
+		// JWT authentication.
+		orgID, userID, jti, err := authenticateJWT(r.Header.Get("Authorization"), authCfg)
+		if err != nil {
+			backend.metrics.authErrors.Inc()
+			httpError(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		// Token revocation check (Redis blocklist).
+		ctx, cancel := context.WithTimeout(r.Context(), 100*time.Millisecond)
+		revoked := isTokenRevoked(ctx, jti, rdb)
+		cancel()
+		if revoked {
+			backend.metrics.authErrors.Inc()
+			httpError(w, "token revoked", http.StatusUnauthorized)
+			return
+		}
+
 		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil { backend.metrics.connectionErrors.Inc(); return }
+		if err != nil {
+			backend.metrics.connectionErrors.Inc()
+			return
+		}
+
+		log.Printf("[websocket-gateway] connected %s org=%s", userID, orgID)
 		backend.HandleConnection(conn, orgID, userID)
 	})
+
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(200); _, _ = w.Write([]byte("ok"))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
 	})
+
+	// P0 FIX: port is now per-replica (WS_PORT env), not hardcoded 8080.
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	log.Printf("[websocket-gateway] WebSocket server on %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatalf("[websocket-gateway] HTTP: %v", err)
+		log.Fatalf("[websocket-gateway] HTTP server: %v", err)
 	}
 }
 
@@ -458,44 +705,50 @@ func startHTTPServer(cfg ServerConfig, authCfg AuthConfig, rateCfg RateLimitingC
 // ─────────────────────────────────────────────────────────────────────────────
 
 func main() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	log.Println("[websocket-gateway] starting...")
-	cfg := loadConfig()
 
-	// setupTracing defined in internal.go; returns (func(ctx) error, error)
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("[websocket-gateway] config error: %v", err)
+	}
+	cfgHolder := NewConfigHolder(cfg)
+
 	shutdown, err := setupTracing("websocket-gateway")
-	if err != nil { log.Fatalf("[websocket-gateway] tracing: %v", err) }
+	if err != nil {
+		log.Fatalf("[websocket-gateway] tracing: %v", err)
+	}
 	defer shutdown(context.Background())
 
 	metrics := NewWebSocketMetrics(cfg.Metrics.Buckets)
-	rdb     := initRedisClusterClient(cfg.Redis) // internal.go
+	rdb := initRedisClusterClient(cfg.Redis)
 
-	// initClickHouseClient defined in internal.go; returns (*CHClient, error)
 	ch, err := initClickHouseClient(cfg.ClickHouse)
-	if err != nil { log.Printf("[websocket-gateway] ClickHouse unavailable: %v", err) }
+	if err != nil {
+		// P0 FIX: ClickHouse unavailability is now a fatal startup error so
+		// the orchestrator knows to restart rather than silently serving
+		// connections with no initial position data.
+		log.Fatalf("[websocket-gateway] ClickHouse init failed: %v", err)
+	}
 
-	backend := NewWebSocketBackend(cfg, rdb, ch, metrics)
+	backend := NewWebSocketBackend(cfgHolder, rdb, ch, metrics)
 
 	go startMetricsServer(cfg.Metrics)
-	go startHTTPServer(cfg.Server, cfg.Auth, cfg.RateLimiting, backend)
+	go startHTTPServer(cfg.Server, cfg.Auth, cfg.RateLimiting, backend, rdb)
+
+	log.Printf(
+		"[websocket-gateway] running (instance=%s ws-port=%d metrics-port=%d origins=%v)",
+		cfg.Redis.Streams.ConsumerName,
+		cfg.Server.Port,
+		cfg.Metrics.Port,
+		cfg.Server.AllowedOrigins,
+	)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	log.Printf("[websocket-gateway] running (instance=%s port=%d)",
-		envOr("INSTANCE_ID", "websocket-gateway-0"), cfg.Metrics.Port)
-
 	<-sig
+
 	log.Println("[websocket-gateway] shutting down...")
 	backend.Shutdown()
 	log.Println("[websocket-gateway] done")
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" { return v }; return def
-}
-
-func envInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil { return n }
-	}
-	return def
 }
