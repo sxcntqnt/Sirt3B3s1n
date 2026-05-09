@@ -84,7 +84,11 @@ type ServiceConfig struct {
 	MaxReplicas     int
 	BaseMetricsPort int
 	BaseHealthPort  int
-	Env             map[string]string
+	// BaseAppPort is the service-level HTTP port base (distinct from metrics/health
+	// ports). When > 0, spawnProcess injects WS_PORT=BaseAppPort+replica so each
+	// websocket-gateway replica binds a unique port. Zero for all other services.
+	BaseAppPort int
+	Env         map[string]string
 }
 
 // ─── config Holder — immutable snapshot + atomic swap, no mutexes ───────────
@@ -158,6 +162,7 @@ func loadConfig() (*OrchestratorConfig, error) {
 	v.SetDefault("services.websocket_gateway.max_replicas", 10)
 	v.SetDefault("services.websocket_gateway.base_metrics_port", 9300)
 	v.SetDefault("services.websocket_gateway.base_health_port", 8300)
+	v.SetDefault("services.websocket_gateway.base_app_port", 8080)
 
 	cfg := &OrchestratorConfig{
 		BinaryDir:             v.GetString("binary_dir"),
@@ -208,6 +213,7 @@ func loadConfig() (*OrchestratorConfig, error) {
 				MaxReplicas:     v.GetInt("services.websocket_gateway.max_replicas"),
 				BaseMetricsPort: v.GetInt("services.websocket_gateway.base_metrics_port"),
 				BaseHealthPort:  v.GetInt("services.websocket_gateway.base_health_port"),
+				BaseAppPort:     v.GetInt("services.websocket_gateway.base_app_port"),
 				Env: map[string]string{
 					"REDIS_PASSWORD":   "${REDIS_PASSWORD}",
 					"CLICKHOUSE_HOST":  "${CLICKHOUSE_HOST}",
@@ -576,6 +582,11 @@ func (sp *ServicePool) spawnProcess(ctx context.Context, inst *ProcessInstance) 
 		fmt.Sprintf("INSTANCE_ID=%s", inst.ID),
 		fmt.Sprintf("REPLICA=%d", inst.Replica),
 	)
+	// Inject application-level port for services that bind their own HTTP port.
+	// websocket-gateway replicas read WS_PORT; BaseAppPort=0 for other services.
+	if sp.cfg.BaseAppPort > 0 {
+		env = append(env, fmt.Sprintf("WS_PORT=%d", sp.cfg.BaseAppPort+inst.Replica))
+	}
 	for k, v := range sp.cfg.Env {
 		env = append(env, fmt.Sprintf("%s=%s", k, os.ExpandEnv(v)))
 	}

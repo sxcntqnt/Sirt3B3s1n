@@ -126,7 +126,7 @@ func loadConfig() (*Config, error) {
 	v.SetDefault("mqtt.qos", 1)
 
 	v.SetDefault("redis.cluster", true)
-	v.SetDefault("redis.nodes", []string{"redis-01:6379", "redis-02:6379", "redis-03:6379"})
+	v.SetDefault("redis.nodes", []string{"127.0.0.1:30001", "127.0.0.1:30002", "127.0.0.1:30003"})
 
 	v.SetDefault("clickhouse.direct_write_enabled", false)
 	v.SetDefault("clickhouse.database", "default")

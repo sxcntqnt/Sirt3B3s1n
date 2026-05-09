@@ -75,14 +75,14 @@ type RedisStreamConfig struct {
 	ConsumerGroup string
 	ConsumerName  string // set to INSTANCE_ID at runtime
 }
-
 type ClickHouseConfig struct {
-	Host           string
-	Username       string
-	Password       string
-	Database       string
-	QueryTimeout   time.Duration
-	ConnectionPool ConnectionPool
+        Host           string
+        Port           int
+        Username       string
+        Password       string
+        Database       string
+        QueryTimeout   time.Duration
+        ConnectionPool ConnectionPool
 }
 
 type ConnectionPool struct {
@@ -169,9 +169,10 @@ func loadConfig() (*Config, error) {
 	v.SetDefault("server.allowed_origins", []string{}) // empty = deny all (safe default)
 
 	v.SetDefault("redis.cluster", true)
-	v.SetDefault("redis.nodes", []string{"redis-01:6379", "redis-02:6379", "redis-03:6379"})
+	v.SetDefault("redis.nodes", []string{"127.0.0.1:30001", "127.0.0.1:30002", "127.0.0.1:30003"})
 	v.SetDefault("redis.streams.consumer_group", "ws-gateway")
 
+        v.SetDefault("clickhouse.port", 9000)
 	v.SetDefault("clickhouse.database", "default")
 	v.SetDefault("clickhouse.query_timeout", "5s")
 	v.SetDefault("clickhouse.connection_pool.max_size", 10)
@@ -210,6 +211,7 @@ func loadConfig() (*Config, error) {
 		},
 		ClickHouse: ClickHouseConfig{
 			Host:         v.GetString("clickhouse.host"),
+		        Port:         v.GetInt("clickhouse.port"),
 			Username:     v.GetString("clickhouse.username"),
 			Password:     v.GetString("clickhouse.password"),
 			Database:     v.GetString("clickhouse.database"),

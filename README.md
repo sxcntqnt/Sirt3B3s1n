@@ -719,3 +719,11 @@ kubectl logs deployment/gps-orchestrator | grep '\[websocket-gateway'
 ```
 
 And check `ws_connections_active` — if it is 0, clients are not connected to the gateway.
+
+To run with a non-default rmqtt setup, export before running the script:
+bashexport MQTT_HOST=10.0.0.10
+export MQTT_PORT=1883
+export MQTT_BROKER=10.0.0.10:1883
+export MQTT_CLUSTER_NODES=10.0.0.10:1883,10.0.0.11:1883,10.0.0.12:1883
+export MQTT_USERNAME=matatu
+export MQTT_PASSWORD=<secret>

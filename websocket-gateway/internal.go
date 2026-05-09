@@ -100,29 +100,41 @@ func initRedisClusterClient(cfg RedisConfig) *redis.ClusterClient {
 type CHClient struct{ conn driver.Conn }
 
 func initClickHouseClient(cfg ClickHouseConfig) (*CHClient, error) {
-	conn, err := clickhouse.Open(&clickhouse.Options{
-		Addr: []string{cfg.Host},
-		Auth: clickhouse.Auth{
-			Database: cfg.Database,
-			Username: cfg.Username,
-			Password: cfg.Password,
-		},
-		MaxOpenConns:    cfg.ConnectionPool.MaxSize,
-		MaxIdleConns:    cfg.ConnectionPool.MinIdle,
-		ConnMaxLifetime: cfg.ConnectionPool.MaxLifetime,
-		DialTimeout:     10 * time.Second,
-		Settings:        clickhouse.Settings{"max_execution_time": int(cfg.QueryTimeout.Seconds())},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("clickhouse open: %w", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := conn.Ping(ctx); err != nil {
-		return nil, fmt.Errorf("clickhouse ping: %w", err)
-	}
-	return &CHClient{conn: conn}, nil
+        addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+
+        conn, err := clickhouse.Open(&clickhouse.Options{
+                Addr: []string{addr},
+
+                Auth: clickhouse.Auth{
+                        Database: cfg.Database,
+                        Username: cfg.Username,
+                        Password: cfg.Password,
+                },
+
+                MaxOpenConns:    cfg.ConnectionPool.MaxSize,
+                MaxIdleConns:    cfg.ConnectionPool.MinIdle,
+                ConnMaxLifetime: cfg.ConnectionPool.MaxLifetime,
+
+                DialTimeout: 10 * time.Second,
+
+                Settings: clickhouse.Settings{
+                        "max_execution_time": int(cfg.QueryTimeout.Seconds()),
+                },
+        })
+        if err != nil {
+                return nil, fmt.Errorf("clickhouse open: %w", err)
+        }
+
+        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+        defer cancel()
+
+        if err := conn.Ping(ctx); err != nil {
+                return nil, fmt.Errorf("clickhouse ping: %w", err)
+        }
+
+        return &CHClient{conn: conn}, nil
 }
+
 
 func (c *CHClient) Query(ctx context.Context, query string, args ...interface{}) (driver.Rows, error) {
 	return c.conn.Query(ctx, query, args...)

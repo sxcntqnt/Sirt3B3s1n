@@ -137,7 +137,7 @@ func loadConfig() (*Config, error) {
 
 	// ── defaults ─────────────────────────────────────────────────────────────
 	v.SetDefault("redis.cluster", true)
-	v.SetDefault("redis.nodes", []string{"redis-01:6379", "redis-02:6379", "redis-03:6379"})
+	v.SetDefault("redis.nodes", []string{"127.0.0.1:30001", "127.0.0.1:30002", "127.0.0.1:30003"})
 	v.SetDefault("redis.consumer_group", "batch-writers")
 	v.SetDefault("redis.streams.batch_prefix", "gps:batch:")
 	v.SetDefault("redis.streams.dlq_prefix", "gps:dlq:")
