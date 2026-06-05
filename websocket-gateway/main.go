@@ -145,7 +145,7 @@ func loadConfig() (*Config, error) {
 	// ── defaults ─────────────────────────────────────────────────────────────
 	// P0 FIX: port from WS_PORT env so each replica binds a different port.
 	// Orchestrator sets WS_PORT=8080+replica, e.g. 8080, 8081, 8082.
-	serverPort := 8080
+	serverPort := 9970
 	if p := os.Getenv("WS_PORT"); p != "" {
 		if n, err := strconv.Atoi(p); err == nil && n > 0 {
 			serverPort = n
